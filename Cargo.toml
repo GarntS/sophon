@@ -1,0 +1,41 @@
+[package]
+name = "sophon"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cuda = ["transcribe-rs/ort-cuda", "ort/cuda"]
+migraphx = ["transcribe-rs/ort-migraphx", "ort/migraphx"]
+
+[dependencies]
+async-trait = "=0.1.89"
+directories = "=6.0.0"
+flate2 = "=1.1.5"
+fs2 = "=0.4.3"
+futures-util = "=0.3.31"
+hound = "=3.5.1"
+libc = "=0.2.177"
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+serde_yaml = "=0.9.34+deprecated"
+sha2 = "=0.10.9"
+tar = "=0.4.44"
+tempfile = "=3.25.0"
+thiserror = "=2.0.17"
+tokio = { version = "=1.48.0", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter"] }
+xz2 = "=0.1.7"
+zbus = { version = "=5.18.0", default-features = false, features = ["tokio"] }
+
+# The default `ort` feature set downloads prebuilt ONNX Runtime binaries. Keep
+# it disabled: Nix supplies and links the compatible runtime instead.
+transcribe-rs = { version = "=0.3.11", path = "third_party/transcribe-rs-migraphx", default-features = false, features = ["onnx"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24"] }
+
+[[bin]]
+name = "migraphx_provider_smoke"
+path = "src/bin/migraphx_provider_smoke.rs"
+required-features = ["migraphx"]
