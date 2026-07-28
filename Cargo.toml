@@ -1,3 +1,7 @@
+[workspace]
+members = ["qwentts-cpp"]
+resolver = "2"
+
 [package]
 name = "sophon"
 version = "0.1.0"

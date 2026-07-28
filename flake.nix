@@ -11,7 +11,11 @@
     in {
       packages = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          # CUDA package outputs require the redistributable CUDA toolkit.
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
           runtimeDefaults = {
             pythonSupport = true;
             openvinoSupport = false;
@@ -23,6 +27,64 @@
           migraphxRuntime = pkgs.onnxruntime.override (runtimeDefaults // {
             rocmSupport = true;
           });
+          mkQwenttsCpp = {
+            name,
+            feature,
+            nativeBuildInputs ? [ ],
+            buildInputs ? [ ],
+            runtimeLibraryPaths ? [ ],
+            environment ? { },
+          }:
+            pkgs.rustPlatform.buildRustPackage (environment // {
+              pname = name;
+              version = "0.1.0";
+              src = pkgs.lib.cleanSource ./.;
+              cargoLock.lockFile = ./Cargo.lock;
+              cargoBuildFlags = [
+                "-p" "qwentts-cpp" "--no-default-features" "--features" feature
+              ];
+              cargoTestFlags = [
+                "-p" "qwentts-cpp" "--no-default-features" "--features" feature
+              ];
+
+              nativeBuildInputs = [
+                pkgs.cmake
+                pkgs.pkg-config
+                pkgs.llvmPackages.libclang
+              ] ++ nativeBuildInputs;
+              buildInputs = [
+                pkgs.openblas
+                pkgs.stdenv.cc.cc.lib
+              ] ++ buildInputs;
+              propagatedBuildInputs = [ pkgs.openblas ] ++ runtimeLibraryPaths;
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              preCheck = ''
+                export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath ([ pkgs.openblas pkgs.stdenv.cc.cc.lib ] ++ runtimeLibraryPaths)}
+              '';
+              installPhase = ''
+                runHook preInstall
+                rlib=$(find target -type f -name libqwentts_cpp.rlib -print -quit)
+                nativeLibDir=$(find target -type d -path '*/build/qwentts-cpp-*/out/lib' -print -quit)
+                test -n "$rlib"
+                test -n "$nativeLibDir"
+                install -Dm644 "$rlib" $out/lib/libqwentts_cpp.rlib
+                find "$nativeLibDir" -maxdepth 1 -type f -name '*.so*' \
+                  -exec install -Dm755 {} $out/lib/ \;
+                test -f $out/lib/libqwen.so
+                test ! -e $out/bin
+                runHook postInstall
+              '';
+              preFixup = ''
+                rpath="\$ORIGIN:${pkgs.lib.makeLibraryPath ([ pkgs.openblas pkgs.stdenv.cc.cc.lib ] ++ runtimeLibraryPaths)}"
+                for library in $out/lib/*.so*; do
+                  patchelf --set-rpath "$rpath" "$library"
+                done
+              '';
+              passthru.backend = feature;
+            });
+          syclAvailable = pkgs ? intel-llvm && pkgs ? level-zero;
+          syclUnavailable =
+            "qwentts-cpp-sycl requires nixpkgs `intel-llvm` and `level-zero` packages; update nixpkgs to a revision providing an Intel-compatible -fsycl toolchain";
           mkSophon = { name, onnxruntime, cargoFeatures ? [ ] }:
             pkgs.rustPlatform.buildRustPackage {
               pname = name;
@@ -66,6 +128,47 @@
               '';
             };
         in rec {
+          qwentts-cpp-cpu = mkQwenttsCpp {
+            name = "qwentts-cpp-cpu";
+            feature = "cpu";
+          };
+          qwentts-cpp-cuda = mkQwenttsCpp {
+            name = "qwentts-cpp-cuda";
+            feature = "cuda";
+            nativeBuildInputs = [ pkgs.cudaPackages.cuda_nvcc ];
+            buildInputs = [ pkgs.cudaPackages.libcublas ];
+            runtimeLibraryPaths = [ pkgs.cudaPackages.libcublas ];
+            environment.CUDA_PATH = "${pkgs.cudaPackages.cuda_nvcc}";
+          };
+          qwentts-cpp-sycl =
+            if syclAvailable then
+              mkQwenttsCpp {
+                name = "qwentts-cpp-sycl";
+                feature = "sycl";
+                nativeBuildInputs = [ pkgs.intel-llvm ];
+                buildInputs = [ pkgs.level-zero pkgs.intel-compute-runtime ];
+                runtimeLibraryPaths = [
+                  pkgs.intel-llvm
+                  pkgs.level-zero
+                  pkgs.intel-compute-runtime
+                ];
+                environment = {
+                  CXX = "${pkgs.intel-llvm}/bin/clang++";
+                  ONEAPI_ROOT = "${pkgs.intel-llvm}";
+                };
+              }
+            else throw syclUnavailable;
+          qwentts-cpp-vulkan = mkQwenttsCpp {
+            name = "qwentts-cpp-vulkan";
+            feature = "vulkan";
+            nativeBuildInputs = [ pkgs.shaderc ];
+            buildInputs = [
+              pkgs.spirv-headers
+              pkgs.vulkan-headers
+              pkgs.vulkan-loader
+            ];
+            runtimeLibraryPaths = [ pkgs.vulkan-loader ];
+          };
           sophon-cpu = mkSophon {
             name = "sophon";
             onnxruntime = cpuRuntime;
@@ -104,7 +207,41 @@
           cpuClosure = pkgs.closureInfo { rootPaths = [ self.packages.${system}.sophon-cpu ]; };
           cudaClosure = pkgs.closureInfo { rootPaths = [ self.packages.${system}.sophon-cuda ]; };
           migraphxClosure = pkgs.closureInfo { rootPaths = [ self.packages.${system}.sophon-migraphx ]; };
+          qwenttsCpu = self.packages.${system}.qwentts-cpp-cpu;
+          qwenttsVulkan = self.packages.${system}.qwentts-cpp-vulkan;
+          qwenttsCpuClosure = pkgs.closureInfo { rootPaths = [ qwenttsCpu ]; };
+          qwenttsVulkanClosure = pkgs.closureInfo { rootPaths = [ qwenttsVulkan ]; };
+          qwenttsCudaEvaluates = builtins.tryEval self.packages.${system}.qwentts-cpp-cuda.drvPath;
+          qwenttsSyclEvaluates = builtins.tryEval self.packages.${system}.qwentts-cpp-sycl.drvPath;
         in {
+          qwentts-cpp-cpu-runtime = pkgs.runCommand "qwentts-cpp-cpu-runtime" {} ''
+            test -f ${qwenttsCpu}/lib/libqwen.so
+            test -f ${qwenttsCpu}/lib/libggml.so
+            test -f ${qwenttsCpu}/lib/libggml-base.so
+            test -f ${qwenttsCpu}/lib/libggml-blas.so
+            test -f ${qwenttsCpu}/lib/libggml-cpu.so
+            test ! -e ${qwenttsCpu}/bin
+            grep -F openblas ${qwenttsCpuClosure}/store-paths
+            ! grep -Ei -- '-(cuda|vulkan|sycl|oneapi|intel-llvm|level-zero)-' ${qwenttsCpuClosure}/store-paths
+            touch $out
+          '';
+          qwentts-cpp-vulkan-runtime = pkgs.runCommand "qwentts-cpp-vulkan-runtime" {} ''
+            test -f ${qwenttsVulkan}/lib/libqwen.so
+            test -f ${qwenttsVulkan}/lib/libggml.so
+            test -f ${qwenttsVulkan}/lib/libggml-base.so
+            test -f ${qwenttsVulkan}/lib/libggml-blas.so
+            test -f ${qwenttsVulkan}/lib/libggml-cpu.so
+            test -f ${qwenttsVulkan}/lib/libggml-vulkan.so
+            test ! -e ${qwenttsVulkan}/bin
+            grep -F openblas ${qwenttsVulkanClosure}/store-paths
+            grep -F vulkan-loader ${qwenttsVulkanClosure}/store-paths
+            ! grep -Ei -- '-(cuda|sycl|oneapi|intel-llvm|level-zero)-' ${qwenttsVulkanClosure}/store-paths
+            touch $out
+          '';
+          qwentts-cpp-cuda-evaluates = assert qwenttsCudaEvaluates.success;
+            pkgs.runCommand "qwentts-cpp-cuda-evaluates" {} "touch $out";
+          qwentts-cpp-sycl-evaluates = assert qwenttsSyclEvaluates.success;
+            pkgs.runCommand "qwentts-cpp-sycl-evaluates" {} "touch $out";
           cpu-provider = pkgs.runCommand "sophon-cpu-provider-smoke" {
             nativeBuildInputs = [ self.packages.${system}.sophon-cpu ];
           } ''
@@ -118,7 +255,7 @@
             touch $out
           '';
           fmt = pkgs.runCommand "sophon-format" { nativeBuildInputs = [ pkgs.rustfmt ]; } ''
-            rustfmt --edition 2024 --check ${self}/src/*.rs
+            rustfmt --edition 2024 --check ${self}/src/*.rs ${self}/qwentts-cpp/src/*.rs ${self}/qwentts-cpp/*.rs ${self}/qwentts-cpp/tests/*.rs
             touch $out
           '';
           dbus-activation = pkgs.runCommand "sophon-dbus-activation" {

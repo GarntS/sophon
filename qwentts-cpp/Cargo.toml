@@ -1,0 +1,26 @@
+[package]
+name = "qwentts-cpp"
+version = "0.1.0"
+edition = "2024"
+description = "Safe Rust bindings for the qwentts.cpp C ABI"
+license = "MIT"
+readme = "README.md"
+links = "qwen"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = []
+sycl = []
+vulkan = []
+
+[dependencies]
+hound = "=3.5.1"
+thiserror = "=2.0.17"
+
+[build-dependencies]
+bindgen = "=0.72.1"
+cmake = "=0.1.58"
+
+[dev-dependencies]
+tempfile = "=3.25.0"
