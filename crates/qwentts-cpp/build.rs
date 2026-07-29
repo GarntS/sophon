@@ -156,7 +156,7 @@ fn stage_and_link_libraries(build_dir: &Path, out_dir: &Path) -> PathBuf {
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
-    let source = manifest_dir.join("../third_party/qwentts.cpp");
+    let source = manifest_dir.join("../../third_party/qwentts.cpp");
     let header = source.join("src/qwen.h");
     if !header.is_file() || !source.join("CMakeLists.txt").is_file() {
         panic!(

@@ -5,6 +5,9 @@ target/
 result
 
 # python / uv (bench harness)
-bench/.venv/
+tests/bench/.venv/
 __pycache__/
 *.egg-info/
+
+# pi-agent nonsense
+.pi/

@@ -364,7 +364,7 @@
             touch $out
           '';
           fmt = pkgs.runCommand "sophon-format" { nativeBuildInputs = [ pkgs.rustfmt ]; } ''
-            rustfmt --edition 2024 --check ${self}/src/*.rs ${self}/qwentts-cpp/src/*.rs ${self}/qwentts-cpp/*.rs ${self}/qwentts-cpp/tests/*.rs
+            rustfmt --edition 2024 --check ${self}/src/*.rs ${self}/crates/qwentts-cpp/src/*.rs ${self}/crates/qwentts-cpp/*.rs ${self}/crates/qwentts-cpp/tests/*.rs
             touch $out
           '';
           dbus-activation = pkgs.runCommand "sophon-dbus-activation" {
