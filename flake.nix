@@ -37,7 +37,7 @@
           }:
             pkgs.rustPlatform.buildRustPackage (environment // {
               pname = name;
-              version = "0.1.0";
+              version = "2026.1.0";
               src = pkgs.lib.cleanSource ./.;
               cargoLock.lockFile = ./Cargo.lock;
               cargoBuildFlags = [
@@ -88,7 +88,7 @@
           mkSophon = { name, onnxruntime, cargoFeatures ? [ ] }:
             pkgs.rustPlatform.buildRustPackage {
               pname = name;
-              version = "0.1.0";
+              version = "2026.1.0";
               src = self;
               cargoLock.lockFile = ./Cargo.lock;
               cargoBuildFlags = [ "--bins" ]

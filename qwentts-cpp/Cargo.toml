@@ -1,6 +1,6 @@
 [package]
 name = "qwentts-cpp"
-version = "0.1.0"
+version = "2026.1.0"
 edition = "2024"
 description = "Safe Rust bindings for the qwentts.cpp C ABI"
 license = "MIT"
