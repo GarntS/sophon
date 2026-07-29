@@ -7,9 +7,10 @@
 mod raw;
 
 use std::{
-    ffi::{CStr, CString, NulError},
+    ffi::{CStr, CString, NulError, c_char, c_void},
     path::Path,
     ptr::NonNull,
+    sync::{Arc, Mutex, RwLock},
 };
 
 use thiserror::Error;
@@ -21,6 +22,8 @@ pub enum QwenTtsError {
     InteriorNul { field: &'static str },
     #[error("text must not be empty")]
     EmptyText,
+    #[error("duration must be finite, positive, and convertible to native tokens")]
+    InvalidDuration,
     #[error("a model must be loaded before {operation}")]
     ModelNotLoaded { operation: &'static str },
     #[error("native initialization failed{diagnostic}")]
@@ -68,6 +71,81 @@ fn c_string(value: &str, field: &'static str) -> Result<CString, QwenTtsError> {
 
 fn path_string(path: &Path, field: &'static str) -> Result<CString, QwenTtsError> {
     c_string(&path.to_string_lossy(), field)
+}
+
+/// Severity of a qwentts.cpp log message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
+}
+
+/// A process-wide qwentts.cpp log callback.
+pub type LogCallback = Arc<dyn Fn(LogLevel, &str) + Send + Sync + 'static>;
+
+static LOG_CALLBACK: RwLock<Option<LogCallback>> = RwLock::new(None);
+static LOG_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+unsafe extern "C" fn log_trampoline(
+    level: raw::qt_log_level,
+    message: *const c_char,
+    _: *mut c_void,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let level = match level {
+            raw::qt_log_level_QT_LOG_DEBUG => LogLevel::Debug,
+            raw::qt_log_level_QT_LOG_INFO => LogLevel::Info,
+            raw::qt_log_level_QT_LOG_WARN => LogLevel::Warning,
+            raw::qt_log_level_QT_LOG_ERROR => LogLevel::Error,
+            _ => LogLevel::Error,
+        };
+        let message = if message.is_null() {
+            String::new()
+        } else {
+            // SAFETY: qwentts.cpp supplies a NUL-terminated message valid for
+            // this call. Copying it prevents borrowed native storage escaping.
+            unsafe { CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        let callback = LOG_CALLBACK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(callback) = callback {
+            callback(level, &message);
+        }
+    }));
+}
+
+/// Replaces the process-wide Rust log callback.
+///
+/// The callback may run reentrantly on caller or native worker threads. Pass
+/// `None` to restore qwentts.cpp's default native logging behavior.
+pub fn set_log_callback(callback: Option<LogCallback>) {
+    let _install_guard = LOG_INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *LOG_CALLBACK
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = callback;
+    // SAFETY: the trampoline has C ABI, uses no borrowed user data, and catches
+    // all callback panics before returning across the native boundary.
+    unsafe {
+        raw::qt_log_set(
+            callback_is_installed().then_some(log_trampoline),
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+fn callback_is_installed() -> bool {
+    LOG_CALLBACK
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
 }
 
 /// Native model-loading settings.
@@ -149,8 +227,9 @@ impl Default for SamplingOptions {
 }
 
 /// The Qwen-specific voice intent for a synthesis request.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum Voice<'a> {
+    #[default]
     Default,
     Named(&'a str),
     Clone(&'a VoiceReference),
@@ -159,12 +238,6 @@ pub enum Voice<'a> {
         transcript: &'a str,
     },
     Design(&'a str),
-}
-
-impl Default for Voice<'_> {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 /// Options for one buffered synthesis operation.
@@ -236,9 +309,18 @@ impl Drop for VoiceReference {
 }
 
 /// A mutable qwentts.cpp engine. It starts unloaded.
+///
+/// The engine is movable between threads, but all safe operations require
+/// exclusive access and it is deliberately not [`Sync`].
 pub struct QwenTtsEngine {
     context: Option<NonNull<raw::qt_context>>,
 }
+
+// SAFETY: The pinned qwentts.cpp ABI documents its context as thread-safe and
+// serializes GPU access within a context. Moving exclusive ownership does not
+// introduce concurrent access; every safe operation continues to require
+// `&mut self`. This assertion must be reviewed when updating the native source.
+unsafe impl Send for QwenTtsEngine {}
 
 impl Default for QwenTtsEngine {
     fn default() -> Self {
@@ -409,6 +491,23 @@ impl QwenTtsEngine {
         }
     }
 
+    /// Converts an output duration to the loaded model's generation-token count.
+    pub fn duration_sec_to_tokens(&self, duration_secs: f32) -> Result<u32, QwenTtsError> {
+        const TOKENS_PER_SECOND: f32 = 12.5;
+        if !duration_secs.is_finite()
+            || duration_secs <= 0.0
+            || duration_secs > i32::MAX as f32 / TOKENS_PER_SECOND
+        {
+            return Err(QwenTtsError::InvalidDuration);
+        }
+        let context = self.context("duration-to-token conversion")?;
+        // SAFETY: context belongs to this loaded engine and the validated value
+        // is within the native conversion's positive i32 output range.
+        let tokens = unsafe { raw::qt_duration_sec_to_tokens(context.as_ptr(), duration_secs) };
+        u32::try_from(tokens)
+            .map_err(|_| QwenTtsError::native("duration-to-token conversion", tokens))
+    }
+
     pub fn speakers(&self) -> Result<Vec<String>, QwenTtsError> {
         let context = self.context("speaker enumeration")?;
         // SAFETY: speaker pointers remain valid while context is loaded; strings are copied immediately.
@@ -433,6 +532,69 @@ impl Drop for QwenTtsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
+    use std::sync::Mutex;
+
+    assert_impl_all!(QwenTtsEngine: Send);
+    assert_not_impl_any!(QwenTtsEngine: Sync);
+    assert_impl_all!(LogCallback: Send, Sync);
+
+    static LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn emit_test_log(level: raw::qt_log_level, message: &[u8]) {
+        let message = CString::new(message).unwrap();
+        // SAFETY: the message is NUL-terminated and remains alive for the call.
+        unsafe { log_trampoline(level, message.as_ptr(), std::ptr::null_mut()) }
+    }
+
+    #[test]
+    fn log_callback_maps_levels_copies_messages_and_can_be_replaced() {
+        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        let first_messages = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&first_messages);
+        set_log_callback(Some(Arc::new(move |level, message| {
+            captured.lock().unwrap().push((level, message.to_owned()));
+        })));
+        emit_test_log(raw::qt_log_level_QT_LOG_DEBUG, b"debug");
+        emit_test_log(raw::qt_log_level_QT_LOG_INFO, b"info");
+        emit_test_log(raw::qt_log_level_QT_LOG_WARN, b"warn");
+        emit_test_log(raw::qt_log_level_QT_LOG_ERROR, b"bad \xff utf-8");
+        assert_eq!(
+            *first_messages.lock().unwrap(),
+            vec![
+                (LogLevel::Debug, "debug".to_owned()),
+                (LogLevel::Info, "info".to_owned()),
+                (LogLevel::Warning, "warn".to_owned()),
+                (LogLevel::Error, "bad \u{fffd} utf-8".to_owned()),
+            ]
+        );
+
+        let replacement_called = Arc::new(Mutex::new(false));
+        let captured = Arc::clone(&replacement_called);
+        set_log_callback(Some(Arc::new(move |_, _| {
+            *captured.lock().unwrap() = true;
+        })));
+        emit_test_log(raw::qt_log_level_QT_LOG_INFO, b"replacement");
+        assert!(*replacement_called.lock().unwrap());
+
+        set_log_callback(None);
+        assert!(!callback_is_installed());
+    }
+
+    #[test]
+    fn log_callback_panics_are_contained() {
+        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        set_log_callback(Some(Arc::new(|_, _| panic!("logger panic"))));
+        emit_test_log(raw::qt_log_level_QT_LOG_ERROR, b"panic safely");
+        set_log_callback(None);
+    }
+
+    #[test]
+    fn unloaded_engine_can_move_between_threads() {
+        let engine = QwenTtsEngine::new();
+        let engine = std::thread::spawn(move || engine).join().unwrap();
+        assert!(!engine.is_loaded());
+    }
 
     #[test]
     fn unloaded_engine_does_not_call_native_synthesis() {
@@ -440,6 +602,32 @@ mod tests {
             QwenTtsEngine::new().synthesize("hello", None),
             Err(QwenTtsError::ModelNotLoaded { .. })
         ));
+    }
+
+    #[test]
+    fn duration_conversion_requires_a_loaded_engine() {
+        assert!(matches!(
+            QwenTtsEngine::new().duration_sec_to_tokens(1.0),
+            Err(QwenTtsError::ModelNotLoaded { .. })
+        ));
+    }
+
+    #[test]
+    fn duration_conversion_rejects_invalid_inputs() {
+        let engine = QwenTtsEngine::new();
+        for duration in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -1.0,
+            f32::MAX,
+        ] {
+            assert!(matches!(
+                engine.duration_sec_to_tokens(duration),
+                Err(QwenTtsError::InvalidDuration)
+            ));
+        }
     }
 
     #[test]
@@ -452,6 +640,7 @@ mod tests {
 
     #[test]
     fn native_failure_preserves_a_copied_diagnostic() {
+        let _guard = LOG_TEST_LOCK.lock().unwrap();
         // SAFETY: the ABI explicitly accepts null context/audio arguments and reports an error.
         unsafe {
             let mut reference: raw::qt_voice_ref = std::mem::zeroed();

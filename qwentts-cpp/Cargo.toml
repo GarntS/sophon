@@ -23,4 +23,5 @@ bindgen = "=0.72.1"
 cmake = "=0.1.58"
 
 [dev-dependencies]
+static_assertions = "=1.1.0"
 tempfile = "=3.25.0"

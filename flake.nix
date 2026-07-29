@@ -85,48 +85,74 @@
           syclAvailable = pkgs ? intel-llvm && pkgs ? level-zero;
           syclUnavailable =
             "qwentts-cpp-sycl requires nixpkgs `intel-llvm` and `level-zero` packages; update nixpkgs to a revision providing an Intel-compatible -fsycl toolchain";
-          mkSophon = { name, onnxruntime, cargoFeatures ? [ ] }:
-            pkgs.rustPlatform.buildRustPackage {
+          mkSophon = { name, onnxruntime, qwenBackend, cargoFeatures ? [ ] }:
+            let
+              featureFlags = [ "--no-default-features" ]
+                ++ pkgs.lib.optional (cargoFeatures != [ ]) "--features"
+                ++ pkgs.lib.optional (cargoFeatures != [ ]) (pkgs.lib.concatStringsSep "," cargoFeatures);
+              qwenNativeBuildInputs =
+                pkgs.lib.optionals (qwenBackend == "cuda") [ pkgs.cudaPackages.cuda_nvcc ]
+                ++ pkgs.lib.optionals (qwenBackend == "vulkan") [ pkgs.shaderc ];
+              qwenBuildInputs = [ pkgs.openblas pkgs.stdenv.cc.cc.lib ]
+                ++ pkgs.lib.optionals (qwenBackend == "cuda") [ pkgs.cudaPackages.libcublas ]
+                ++ pkgs.lib.optionals (qwenBackend == "vulkan") [
+                  pkgs.spirv-headers
+                  pkgs.vulkan-headers
+                  pkgs.vulkan-loader
+                ];
+              qwenRuntimeLibraries =
+                pkgs.lib.optionals (qwenBackend == "cuda") [ pkgs.cudaPackages.libcublas ]
+                ++ pkgs.lib.optionals (qwenBackend == "vulkan") [ pkgs.vulkan-loader ];
+            in pkgs.rustPlatform.buildRustPackage {
               pname = name;
-              version = "2026.1.0";
+              version = "2026.1.1";
               src = self;
               cargoLock.lockFile = ./Cargo.lock;
-              cargoBuildFlags = [ "--bins" ]
-                ++ pkgs.lib.optional (cargoFeatures != [ ]) "--features"
-                ++ pkgs.lib.optional (cargoFeatures != [ ]) (pkgs.lib.concatStringsSep "," cargoFeatures);
-              cargoInstallFlags = [ "--path" "." "--bins" ]
-                ++ pkgs.lib.optional (cargoFeatures != [ ]) "--features"
-                ++ pkgs.lib.optional (cargoFeatures != [ ]) (pkgs.lib.concatStringsSep "," cargoFeatures);
+              cargoBuildFlags = [ "--bins" ] ++ featureFlags;
+              cargoInstallFlags = [ "--path" "." "--bins" ] ++ featureFlags;
               cargoCheckType = "clippy";
-              cargoCheckFlags = [ "--all-targets" "--" "-D" "warnings" ];
+              cargoCheckFlags = [ "--all-targets" ] ++ featureFlags ++ [ "--" "-D" "warnings" ];
+              cargoTestFlags = featureFlags;
 
               nativeBuildInputs = [
+                pkgs.cmake
                 pkgs.pkg-config
                 pkgs.dbus
                 pkgs.makeWrapper
                 pkgs.llvmPackages.libclang
-              ];
+              ] ++ qwenNativeBuildInputs;
               buildInputs = [
                 pkgs.cacert
                 pkgs.openssl
                 pkgs.pipewire
                 onnxruntime
-                pkgs.stdenv.cc.cc.lib
-              ];
+              ] ++ qwenBuildInputs;
               BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include";
               LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
               ORT_LIB_LOCATION = "${onnxruntime}/lib";
               ORT_PREFER_DYNAMIC_LINK = "1";
               ORT_OFFLINE = "1";
+              CUDA_PATH = if qwenBackend == "cuda" then "${pkgs.cudaPackages.cuda_nvcc}" else "";
 
               # nixpkgs provides the runtime. These settings prevent ort-sys
               # from downloading or statically embedding another copy.
               preCheck = ''
-                export LD_LIBRARY_PATH=${onnxruntime}/lib:${pkgs.stdenv.cc.cc.lib}/lib
+                export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath ([ onnxruntime pkgs.openblas pkgs.stdenv.cc.cc.lib ] ++ qwenRuntimeLibraries)}
                 export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
                 export SOPHON_DBUS_SESSION_CONFIG=${pkgs.dbus}/share/dbus-1/session.conf
               '';
               postInstall = ''
+                nativeLibDir=$(find target -type d -path '*/build/qwentts-cpp-*/out/lib' -print -quit)
+                test -n "$nativeLibDir"
+                mkdir -p $out/lib
+                find "$nativeLibDir" -maxdepth 1 -type f -name '*.so*' \
+                  -exec install -Dm755 {} $out/lib/ \;
+                test -f $out/lib/libqwen.so
+                test -f $out/lib/libggml.so
+                test -f $out/lib/libggml-base.so
+                test -f $out/lib/libggml-${qwenBackend}.so || test "${qwenBackend}" = cpu
+                test -f $out/lib/libggml-cpu.so || test "${qwenBackend}" != cpu
+
                 mkdir -p $out/share/dbus-1/services
                 cat > $out/share/dbus-1/services/com.garntresearch.sophon.service <<EOF
                 [D-BUS Service]
@@ -134,13 +160,18 @@
                 Exec=$out/bin/sophon
                 EOF
               '';
-              postFixup = ''
+              preFixup = ''
+                externalRpath=${pkgs.lib.makeLibraryPath ([ onnxruntime pkgs.pipewire pkgs.openblas pkgs.stdenv.cc.cc.lib ] ++ qwenRuntimeLibraries)}
+                for library in $out/lib/*.so*; do
+                  patchelf --set-rpath "\$ORIGIN:$externalRpath" "$library"
+                done
                 for binary in $out/bin/*; do
-                  patchelf --add-rpath ${onnxruntime}/lib:${pkgs.pipewire}/lib:${pkgs.stdenv.cc.cc.lib}/lib "$binary"
+                  patchelf --add-rpath "\$ORIGIN/../lib:$externalRpath" "$binary"
                 done
                 wrapProgram $out/bin/sophon \
                   --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.espeak-ng ]}
               '';
+              passthru.qwenBackend = qwenBackend;
             };
         in rec {
           qwentts-cpp-cpu = mkQwenttsCpp {
@@ -187,15 +218,19 @@
           sophon-cpu = mkSophon {
             name = "sophon";
             onnxruntime = cpuRuntime;
+            qwenBackend = "cpu";
+            cargoFeatures = [ "qwen-cpu" ];
           };
           sophon-cuda = mkSophon {
             name = "sophon-cuda";
             onnxruntime = cudaRuntime;
+            qwenBackend = "cuda";
             cargoFeatures = [ "cuda" ];
           };
           sophon-migraphx = mkSophon {
             name = "sophon-migraphx";
             onnxruntime = migraphxRuntime;
+            qwenBackend = "vulkan";
             cargoFeatures = [ "migraphx" ];
           };
           default = sophon-cpu;
@@ -222,7 +257,10 @@
               pkgs.rustc
               pkgs.rustfmt
               pkgs.clippy
+              pkgs.cmake
               pkgs.pkg-config
+              pkgs.openblas
+              pkgs.stdenv.cc
               pkgs.openssl
               pkgs.dbus
               pkgs.pipewire
@@ -232,7 +270,7 @@
             ];
             BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include";
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            LD_LIBRARY_PATH = "${onnxruntime}/lib";
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ onnxruntime pkgs.openblas pkgs.stdenv.cc.cc.lib ];
             ORT_LIB_LOCATION = "${onnxruntime}/lib";
             ORT_PREFER_DYNAMIC_LINK = "1";
             ORT_OFFLINE = "1";
@@ -251,6 +289,21 @@
           qwenttsVulkanClosure = pkgs.closureInfo { rootPaths = [ qwenttsVulkan ]; };
           qwenttsCudaEvaluates = builtins.tryEval self.packages.${system}.qwentts-cpp-cuda.drvPath;
           qwenttsSyclEvaluates = builtins.tryEval self.packages.${system}.qwentts-cpp-sycl.drvPath;
+          mkSophonQwenRuntimeCheck = { name, package, backend, forbiddenBackends }:
+            pkgs.runCommand name { nativeBuildInputs = [ pkgs.binutils pkgs.patchelf ]; } ''
+              for library in libqwen.so libggml.so libggml-base.so libggml-blas.so libggml-${backend}.so; do
+                test -f ${package}/lib/$library
+              done
+              for forbidden in ${pkgs.lib.concatStringsSep " " forbiddenBackends}; do
+                test ! -e ${package}/lib/libggml-$forbidden.so
+              done
+              patchelf --print-rpath ${package}/bin/.sophon-wrapped | grep -F '$ORIGIN/../lib'
+              patchelf --print-rpath ${package}/lib/libqwen.so | grep -F '$ORIGIN'
+              ! ldd ${package}/bin/.sophon-wrapped | grep -F 'not found'
+              ldd ${package}/bin/.sophon-wrapped | grep -F libqwen.so
+              readelf -d ${package}/lib/libqwen.so | grep -F 'libggml-${backend}.so'
+              touch $out
+            '';
         in {
           qwentts-cpp-cpu-runtime = pkgs.runCommand "qwentts-cpp-cpu-runtime" {} ''
             test -f ${qwenttsCpu}/lib/libqwen.so
@@ -278,6 +331,24 @@
           '';
           qwentts-cpp-cuda-evaluates = assert qwenttsCudaEvaluates.success;
             pkgs.runCommand "qwentts-cpp-cuda-evaluates" {} "touch $out";
+          sophon-cpu-qwen-runtime = mkSophonQwenRuntimeCheck {
+            name = "sophon-cpu-qwen-runtime";
+            package = self.packages.${system}.sophon-cpu;
+            backend = "cpu";
+            forbiddenBackends = [ "cuda" "vulkan" ];
+          };
+          sophon-cuda-qwen-runtime = mkSophonQwenRuntimeCheck {
+            name = "sophon-cuda-qwen-runtime";
+            package = self.packages.${system}.sophon-cuda;
+            backend = "cuda";
+            forbiddenBackends = [ "vulkan" ];
+          };
+          sophon-migraphx-qwen-runtime = mkSophonQwenRuntimeCheck {
+            name = "sophon-migraphx-qwen-runtime";
+            package = self.packages.${system}.sophon-migraphx;
+            backend = "vulkan";
+            forbiddenBackends = [ "cuda" ];
+          };
           qwentts-cpp-sycl-evaluates = assert qwenttsSyclEvaluates.success;
             pkgs.runCommand "qwentts-cpp-sycl-evaluates" {} "touch $out";
           cpu-provider = pkgs.runCommand "sophon-cpu-provider-smoke" {
@@ -327,9 +398,12 @@
               grep -Ei -- '-espeak-ng-' "$closure/store-paths"
               grep -Ei -- '-onnxruntime-' "$closure/store-paths"
             done
-            ! grep -Ei -- '-(cuda|rocm|migraphx|hip|xorg|gtk|qt|pulseaudio|portal)-' ${cpuClosure}/store-paths
-            ! grep -Ei -- '-(rocm|migraphx|amd|hip)-' ${cudaClosure}/store-paths
+            ! grep -Ei -- '-(cuda|vulkan|rocm|migraphx|hip|xorg|gtk|qt|pulseaudio|portal)-' ${cpuClosure}/store-paths
+            grep -Ei -- '-cuda-' ${cudaClosure}/store-paths
+            ! grep -Ei -- '-(vulkan|rocm|migraphx|amd|hip)-' ${cudaClosure}/store-paths
             grep -Ei -- '-(rocm|migraphx|hip)-' ${migraphxClosure}/store-paths
+            grep -Ei -- '-vulkan-loader-' ${migraphxClosure}/store-paths
+            ! grep -Ei -- '-cuda-' ${migraphxClosure}/store-paths
             touch $out
           '';
           cuda-evaluates = self.packages.${system}.sophon-cuda;

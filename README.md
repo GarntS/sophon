@@ -2,19 +2,51 @@
 
 Sophon is a headless session D-Bus speech-to-text (STT) and text-to-speech (TTS) service. It performs local inference and exchanges complete audio through files, transferred descriptors, or PipeWire playback.
 
-STT uses [`transcribe-rs`](https://github.com/cjpais/transcribe-rs.git) with Parakeet or Canary on CPU, CUDA, or AMD MIGraphX ONNX Runtime packages. TTS uses the Kokoro engine from `tts-rs`, producing mono 24 kHz float PCM with named voices and speed control.
+STT uses [`transcribe-rs`](https://github.com/cjpais/transcribe-rs.git) with Parakeet or Canary on CPU, CUDA, or AMD MIGraphX ONNX Runtime packages. TTS produces mono 24 kHz float PCM using either Kokoro from `tts-rs` or curated Qwen3-TTS Base, CustomVoice, and VoiceDesign models through `qwentts-cpp`.
 
 ## Install
 
-This project targets NixOS and provides separate ONNX Runtime packages:
+This project targets NixOS and provides backend-paired packages:
 
 ```sh
-nix profile install .#sophon-cpu       # default, CPU only
-nix profile install .#sophon-cuda      # CUDA with CPU fallback
-nix profile install .#sophon-migraphx  # AMD MIGraphX with CPU fallback
+nix profile install .#sophon-cpu       # ONNX CPU + Qwen CPU/OpenBLAS
+nix profile install .#sophon-cuda      # ONNX CUDA + Qwen CUDA
+nix profile install .#sophon-migraphx  # ONNX MIGraphX + Qwen Vulkan
 ```
 
-The runtime closure includes PipeWire and `espeak-ng`, which Kokoro uses for phonemization.
+| Package | STT backend | Qwen backend | Runtime requirements |
+|---|---|---|---|
+| `sophon-cpu` | ONNX Runtime CPU | GGML CPU/OpenBLAS | x86-64 CPU and sufficient RAM |
+| `sophon-cuda` | ONNX Runtime CUDA | GGML CUDA | compatible NVIDIA driver/CUDA device |
+| `sophon-migraphx` | ONNX Runtime MIGraphX | GGML Vulkan | compatible AMD ROCm/MIGraphX stack plus a Vulkan loader and device |
+
+Each output includes `libqwen`, common GGML libraries, its selected GGML backend, and relocatable runtime search paths. Accelerator packages retain CPU fallback libraries but do not include the unrelated Qwen accelerator. The runtime closure also includes PipeWire and `espeak-ng`, which Kokoro uses for phonemization.
+
+### Validation
+
+Ordinary checks are model-free: they compile the ignored Qwen smoke harness but never download or load multi-gigabyte GGUF files.
+
+```sh
+nix develop -c cargo fmt --all -- --check
+nix develop -c cargo clippy --all-targets -- -D warnings
+nix develop -c cargo test --workspace
+nix build .#checks.x86_64-linux.sophon-cpu-qwen-runtime
+nix build .#checks.x86_64-linux.dbus-activation
+```
+
+Backend-capable builders can additionally run `sophon-cuda-qwen-runtime`, `sophon-migraphx-qwen-runtime`, and the full `nix flake check`. Those checks inspect installed native libraries, loader resolution, exact backend selection, RPATHs, and accelerator closure policy.
+
+Real-model synthesis is explicitly opt-in. Supply exact curated files matching the selected registry manifests, then run the ignored harness:
+
+```sh
+export SOPHON_QWEN_CODEC=/models/qwen-tokenizer-12hz-Q8_0.gguf
+export SOPHON_QWEN_BASE_TALKER=/models/qwen-talker-0.6b-base-Q8_0.gguf
+export SOPHON_QWEN_CUSTOM_VOICE_TALKER=/models/qwen-talker-0.6b-customvoice-Q8_0.gguf
+export SOPHON_QWEN_VOICE_DESIGN_TALKER=/models/qwen-talker-1.7b-voicedesign-Q8_0.gguf
+nix develop -c cargo test --test qwen_real_model_smoke -- --ignored --nocapture
+```
+
+The heavyweight harness verifies finite, nonempty mono 24 kHz output for default, named, one-shot clone, and voice-design synthesis.
 
 ## Configuration
 
@@ -54,9 +86,65 @@ tts:
   queue_capacity: 8
 ```
 
-Defaults cache STT beneath `$XDG_CACHE_HOME/sophon/models` and TTS beneath `$XDG_CACHE_HOME/sophon/models/tts`. A configured local model path is validated and never replaced by an automatic download. Registry downloads use pinned HTTPS release artifacts, per-file SHA-256 verification, locking, and atomic publication.
+Defaults cache STT beneath `$XDG_CACHE_HOME/sophon/models` and TTS beneath `$XDG_CACHE_HOME/sophon/models/tts`. A configured local model path is validated and never replaced by an automatic download. Registry downloads use pinned HTTPS release artifacts, exact byte-size and SHA-256 verification, per-digest locking, temporary streaming files, and atomic publication. Canonical files live at `artifacts/<sha256>/<filename>`; models sharing an artifact resolve the same verified file. Download progress is aggregate verified/downloaded bytes rather than completed-file count.
 
 The Kokoro int8 model is approximately 88 MiB and its voice archive approximately 27 MiB, for an initial download/cache footprint of roughly 115 MiB, excluding the generated optimized ONNX graph.
+
+### Qwen3-TTS models
+
+All Qwen files are Q8_0 GGUF artifacts pinned to revision `e0f336a048a3de02b29b8ad92969217d9ecffe3e` of `Serveurperso/Qwen3-TTS-GGUF`. Every model uses the same `qwen-tokenizer-12hz-Q8_0.gguf` codec (291,150,624 bytes, about 278 MiB), which is stored once in the content-addressed cache.
+
+| Model ID | Mode | Talker size | Pair footprint | Default |
+|---|---|---:|---:|---|
+| `qwen3-tts-0.6b-base-q8_0` | Base | 992,615,488 B | ~1.20 GiB | Base |
+| `qwen3-tts-1.7b-base-q8_0` | Base | 2,079,448,256 B | ~2.21 GiB | |
+| `qwen3-tts-0.6b-custom-voice-q8_0` | CustomVoice | 968,588,544 B | ~1.17 GiB | CustomVoice |
+| `qwen3-tts-1.7b-custom-voice-q8_0` | CustomVoice | 2,042,834,304 B | ~2.17 GiB | |
+| `qwen3-tts-1.7b-voice-design-q8_0` | VoiceDesign | 2,042,833,824 B | ~2.17 GiB | VoiceDesign |
+
+Qwen configuration is typed by the selected model. Fields belonging to another mode are rejected:
+
+```yaml
+# Base: default synthesis and one-shot cloning
+tts:
+  provider: qwentts-cpp
+  model_id: qwen3-tts-0.6b-base-q8_0 # provider-only config also defaults here
+  default_speed: 1.0
+  sampling:
+    # seed: 42 # omit for random seeds; configure for deterministic replay
+    max_new_tokens: 2048
+    temperature: 0.9
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.05
+```
+
+```yaml
+# CustomVoice: named speakers
+tts:
+  provider: qwentts-cpp
+  model_id: qwen3-tts-0.6b-custom-voice-q8_0
+  default_voice: vivian
+```
+
+```yaml
+# VoiceDesign: a request voice_description can override this for one call
+tts:
+  provider: qwentts-cpp
+  model_id: qwen3-tts-1.7b-voice-design-q8_0
+  default_voice_description: A warm, clear, natural adult voice with moderate pitch and pace.
+```
+
+The daemon-wide Qwen sampling policy cannot be overridden per request. Defaults are a random seed, 2048 new tokens, temperature 0.9, top-k 50, top-p 1.0, and repetition penalty 1.05. The effective token maximum is the lower of `max_new_tokens` and the native conversion of `max_generated_audio_seconds`. Configured numeric seeds are reused for deterministic requests.
+
+Omitted Qwen language selects automatic detection. Supported case-insensitive base and documented regional tags cover English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, and Italian; unsupported tags return `InvalidTtsOptions` instead of falling back to English.
+
+| Provider mode | Named voices | One-shot cloning | Voice design | Speed control |
+|---|---:|---:|---:|---:|
+| Kokoro | yes | no | no | yes (0.5–2.0) |
+| Qwen Base | no | yes | no | no (must be 1.0) |
+| Qwen CustomVoice | yes | no | no | no (must be 1.0) |
+| Qwen VoiceDesign | no | no | yes | no (must be 1.0) |
 
 TTS configuration failure is isolated from STT initialization, and STT failure does not overwrite TTS lifecycle state.
 
@@ -88,14 +176,14 @@ Options are strict D-Bus variants:
 |---|---|---|
 | `voice` | `s` | Named voice advertised by `AvailableVoices` |
 | `language` | `s` | Language tag compatible with the selected voice |
-| `speed` | `d` | Finite multiplier from `0.5` through `2.0` |
+| `speed` | `d` | Finite multiplier from `0.5` through `2.0` for providers advertising `speed-control`; Qwen requires `1.0` |
 | `clone_audio` | `h` | Transferred canonical reference-WAV descriptor |
 | `clone_transcript` | `s` | Optional transcript; requires `clone_audio` |
 | `voice_description` | `s` | Provider-specific voice-design intent |
 
 `voice`, `clone_audio`, and `voice_description` are mutually exclusive. Omitted voice and speed use configured defaults. Unknown keys, wrong variant types, unavailable voices, contradictory intents, orphan clone transcripts, invalid language/voice combinations, and invalid speed return `InvalidTtsOptions` before inference is queued.
 
-Kokoro supports default and named voices. It reports cloning and voice design as unsupported; those valid intents return `UnsupportedCapability` without fallback.
+Kokoro supports default and named voices. Qwen Base supports default synthesis and cloning, CustomVoice supports default/named speakers, and VoiceDesign supports its configured default plus per-request design descriptions. Unsupported valid intents return `UnsupportedCapability` without fallback. `TtsCapabilities` reports `named-voices`, `voice-cloning`, `voice-design`, and `speed-control` as applicable.
 
 ### Lifecycle and capability discovery
 

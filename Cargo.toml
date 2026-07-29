@@ -4,13 +4,16 @@ resolver = "2"
 
 [package]
 name = "sophon"
-version = "2026.1.0"
+version = "2026.1.1"
 edition = "2024"
 
 [features]
-default = []
-cuda = ["transcribe-rs/ort-cuda", "ort/cuda"]
-migraphx = ["transcribe-rs/ort-migraphx", "ort/migraphx"]
+default = ["qwen-cpu"]
+cuda = ["transcribe-rs/ort-cuda", "ort/cuda", "qwen-cuda"]
+migraphx = ["transcribe-rs/ort-migraphx", "ort/migraphx", "qwen-vulkan"]
+qwen-cpu = ["dep:qwentts-cpp", "qwentts-cpp/cpu"]
+qwen-cuda = ["dep:qwentts-cpp", "qwentts-cpp/cuda"]
+qwen-vulkan = ["dep:qwentts-cpp", "qwentts-cpp/vulkan"]
 
 [dependencies]
 async-trait = "=0.1.89"
@@ -22,6 +25,7 @@ hound = "=3.5.1"
 libc = "=0.2.177"
 memfd = "=0.6.5"
 pipewire = "=0.10.0"
+qwentts-cpp = { path = "qwentts-cpp", version = "=2026.1.0", default-features = false, optional = true }
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"

@@ -49,6 +49,27 @@ pub fn decode_options(
     Ok(options)
 }
 
+fn validate_consumed_tts_text(value: &str, field: &str, max_bytes: u64) -> Result<(), SophonError> {
+    if value.len() as u64 > max_bytes {
+        return Err(SophonError::ResourceLimit(format!(
+            "{field} exceeds configured byte limit"
+        )));
+    }
+    if value.trim().is_empty() {
+        return Err(SophonError::InvalidTtsOptions(format!(
+            "{field} must not be empty when supplied"
+        )));
+    }
+    if value.chars().any(|character| {
+        character == '\0' || (character.is_control() && !character.is_whitespace())
+    }) {
+        return Err(SophonError::InvalidTtsOptions(format!(
+            "{field} contains a disallowed control character"
+        )));
+    }
+    Ok(())
+}
+
 pub fn decode_tts_options(
     text: &str,
     values: BTreeMap<String, TtsOptionValue>,
@@ -61,7 +82,7 @@ pub fn decode_tts_options(
             "text must not be empty or whitespace".into(),
         ));
     }
-    if text.len() as u64 > config.max_text_bytes {
+    if text.len() as u64 > config.operational.max_text_bytes {
         return Err(SophonError::ResourceLimit(
             "UTF-8 text exceeds configured byte limit".into(),
         ));
@@ -69,7 +90,7 @@ pub fn decode_tts_options(
 
     let mut voice = None;
     let mut language = None;
-    let mut speed = config.default_speed;
+    let mut speed = config.operational.default_speed;
     let mut clone_audio = None;
     let mut clone_transcript = None;
     let mut voice_description = None;
@@ -103,6 +124,11 @@ pub fn decode_tts_options(
             "speed must be finite and between 0.5 and 2.0".into(),
         ));
     }
+    if !capabilities.speed_control && speed != 1.0 {
+        return Err(SophonError::InvalidTtsOptions(
+            "the active TTS provider does not support speed control".into(),
+        ));
+    }
     if language.as_ref().is_some_and(|language| {
         language.trim().is_empty()
             || !language
@@ -118,21 +144,19 @@ pub fn decode_tts_options(
             "voice must not be empty".into(),
         ));
     }
-    if clone_transcript
-        .as_ref()
-        .is_some_and(|transcript| transcript.trim().is_empty())
-    {
-        return Err(SophonError::InvalidTtsOptions(
-            "clone_transcript must not be empty when supplied".into(),
-        ));
+    if let Some(transcript) = &clone_transcript {
+        validate_consumed_tts_text(
+            transcript,
+            "clone_transcript",
+            config.operational.max_text_bytes,
+        )?;
     }
-    if voice_description
-        .as_ref()
-        .is_some_and(|description| description.trim().is_empty())
-    {
-        return Err(SophonError::InvalidTtsOptions(
-            "voice_description must not be empty".into(),
-        ));
+    if let Some(description) = &voice_description {
+        validate_consumed_tts_text(
+            description,
+            "voice_description",
+            config.operational.max_text_bytes,
+        )?;
     }
     if clone_transcript.is_some() && clone_audio.is_none() {
         return Err(SophonError::InvalidTtsOptions(
@@ -169,8 +193,8 @@ pub fn decode_tts_options(
         VoiceIntent::Clone {
             reference: read_clone_fd(
                 fd,
-                config.max_reference_audio_bytes,
-                config.max_reference_audio_seconds,
+                config.operational.max_reference_audio_bytes,
+                config.operational.max_reference_audio_seconds,
             )?,
             transcript: clone_transcript,
         }
@@ -217,6 +241,7 @@ mod tests {
             named_voices: true,
             voice_cloning: false,
             voice_design: false,
+            speed_control: true,
         }
     }
     #[test]
@@ -276,14 +301,14 @@ mod tests {
 
         let defaults =
             decode_tts_options("hello", BTreeMap::new(), &config, capabilities(), &voices).unwrap();
-        assert_eq!(defaults.speed, config.default_speed);
+        assert_eq!(defaults.speed, config.operational.default_speed);
         assert!(matches!(defaults.voice, VoiceIntent::Default));
     }
 
     #[test]
     fn tts_options_reject_types_intent_conflicts_orphans_ranges_and_text_limits() {
         let mut config = tts_config();
-        config.max_text_bytes = 4;
+        config.operational.max_text_bytes = 4;
         let voices = vec!["af_heart".into()];
         let invalid = [
             BTreeMap::from([("unknown".into(), TtsOptionValue::String("x".into()))]),
@@ -304,7 +329,7 @@ mod tests {
         for values in invalid {
             assert!(matches!(
                 decode_tts_options("test", values, &config, capabilities(), &voices),
-                Err(SophonError::InvalidTtsOptions(_))
+                Err(SophonError::InvalidTtsOptions(_) | SophonError::ResourceLimit(_))
             ));
         }
         assert!(matches!(
@@ -321,6 +346,77 @@ mod tests {
             decode_tts_options("  ", BTreeMap::new(), &config, capabilities(), &voices),
             Err(SophonError::InvalidTtsOptions(_))
         ));
+    }
+
+    #[test]
+    fn text_like_tts_inputs_are_limited_independently_before_native_work() {
+        let mut config = tts_config();
+        config.operational.max_text_bytes = 4;
+        let mut design_capable = capabilities();
+        design_capable.voice_design = true;
+        let request = decode_tts_options(
+            "test",
+            BTreeMap::from([(
+                "voice_description".into(),
+                TtsOptionValue::String("warm".into()),
+            )]),
+            &config,
+            design_capable,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(request.voice, VoiceIntent::Design(description) if description == "warm"));
+
+        for description in ["large", "bad\0"] {
+            assert!(matches!(
+                decode_tts_options(
+                    "test",
+                    BTreeMap::from([(
+                        "voice_description".into(),
+                        TtsOptionValue::String(description.into()),
+                    )]),
+                    &config,
+                    design_capable,
+                    &[],
+                ),
+                Err(SophonError::ResourceLimit(_) | SophonError::InvalidTtsOptions(_))
+            ));
+        }
+
+        let file = tempfile::tempfile().unwrap();
+        let fd: OwnedFd = file.into();
+        let mut clone_capable = capabilities();
+        clone_capable.voice_cloning = true;
+        assert!(matches!(
+            decode_tts_options(
+                "test",
+                BTreeMap::from([
+                    ("clone_audio".into(), TtsOptionValue::UnixFd(fd)),
+                    (
+                        "clone_transcript".into(),
+                        TtsOptionValue::String("large".into()),
+                    ),
+                ]),
+                &config,
+                clone_capable,
+                &[],
+            ),
+            Err(SophonError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_speed_is_rejected_during_decode_before_queueing() {
+        let config = tts_config();
+        let mut unsupported = capabilities();
+        unsupported.speed_control = false;
+        let mut values = BTreeMap::new();
+        values.insert("speed".into(), TtsOptionValue::Double(1.25));
+        assert!(matches!(
+            decode_tts_options("hello", values, &config, unsupported, &[]),
+            Err(SophonError::InvalidTtsOptions(_))
+        ));
+        assert!(decode_tts_options("hello", BTreeMap::new(), &config, unsupported, &[]).is_ok());
     }
 
     #[test]

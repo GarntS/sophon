@@ -124,6 +124,7 @@ impl TtsProvider for FixtureTtsProvider {
             named_voices: true,
             voice_cloning: false,
             voice_design: false,
+            speed_control: true,
         }
     }
 
@@ -237,19 +238,19 @@ async fn isolated_session_bus_covers_the_public_contract() {
     let tts_calls = Arc::new(Mutex::new(Vec::new()));
     let playback_calls = Arc::new(Mutex::new(Vec::new()));
     let mut tts_config = default_tts_config();
-    tts_config.queue_capacity = 2;
+    tts_config.operational.queue_capacity = 2;
     let tts_worker = TtsWorker::new(
         Box::new(FixtureTtsProvider {
             calls: tts_calls.clone(),
         }),
-        tts_config.queue_capacity,
-        tts_config.max_generated_audio_seconds,
+        tts_config.operational.queue_capacity,
+        tts_config.operational.max_generated_audio_seconds,
     );
     let playback = PlaybackWorker::new(
         Box::new(FixturePlayback {
             calls: playback_calls.clone(),
         }),
-        tts_config.queue_capacity,
+        tts_config.operational.queue_capacity,
     );
     let tts_service = Arc::new(TtsService::new(
         tts_lifecycle.clone(),
@@ -305,6 +306,7 @@ async fn isolated_session_bus_covers_the_public_contract() {
             named_voices: true,
             voice_cloning: false,
             voice_design: false,
+            speed_control: true,
         },
     );
     let error = proxy
@@ -530,6 +532,124 @@ async fn isolated_session_bus_covers_the_public_contract() {
             named_voices: true,
             voice_cloning: false,
             voice_design: false,
+            speed_control: true,
+        },
+    );
+    let capabilities = Vec::<String>::try_from(
+        properties
+            .get(
+                zbus::names::InterfaceName::try_from(INTERFACE).unwrap(),
+                "TtsCapabilities",
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(capabilities, ["named-voices", "speed-control"]);
+
+    for (model, voices, capabilities, expected_capability) in [
+        (
+            "qwen3-tts-0.6b-base-q8_0",
+            Vec::new(),
+            TtsCapabilities {
+                named_voices: false,
+                voice_cloning: true,
+                voice_design: false,
+                speed_control: false,
+            },
+            "voice-cloning",
+        ),
+        (
+            "qwen3-tts-0.6b-custom-voice-q8_0",
+            vec!["vivian".into(), "ryan".into()],
+            TtsCapabilities {
+                named_voices: true,
+                voice_cloning: false,
+                voice_design: false,
+                speed_control: false,
+            },
+            "named-voices",
+        ),
+        (
+            "qwen3-tts-1.7b-voice-design-q8_0",
+            Vec::new(),
+            TtsCapabilities {
+                named_voices: false,
+                voice_cloning: false,
+                voice_design: true,
+                speed_control: false,
+            },
+            "voice-design",
+        ),
+    ] {
+        tts_lifecycle.loading("qwentts-cpp", model);
+        tts_lifecycle.downloading(0.5);
+        tts_lifecycle.ready(voices.clone(), capabilities);
+        let interface_name = zbus::names::InterfaceName::try_from(INTERFACE).unwrap();
+        let active_provider = String::try_from(
+            properties
+                .get(interface_name.clone(), "ActiveTtsProvider")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let active_model = String::try_from(
+            properties
+                .get(interface_name.clone(), "ActiveTtsModel")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let available_voices = Vec::<String>::try_from(
+            properties
+                .get(interface_name.clone(), "AvailableVoices")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let advertised = Vec::<String>::try_from(
+            properties
+                .get(interface_name.clone(), "TtsCapabilities")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let progress = f64::try_from(
+            properties
+                .get(interface_name, "TtsDownloadProgress")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active_provider, "qwentts-cpp");
+        assert_eq!(active_model, model);
+        assert_eq!(available_voices, voices);
+        assert_eq!(advertised, [expected_capability]);
+        assert_eq!(progress, 0.5);
+    }
+    tts_lifecycle.failed("isolated Qwen initialization failure");
+    let interface_name = zbus::names::InterfaceName::try_from(INTERFACE).unwrap();
+    assert_eq!(
+        String::try_from(
+            properties
+                .get(interface_name.clone(), "TtsState")
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        "Failed"
+    );
+    assert_eq!(
+        String::try_from(properties.get(interface_name, "State").await.unwrap()).unwrap(),
+        "Downloading"
+    );
+    tts_lifecycle.ready(
+        vec!["af_heart".into(), "am_adam".into()],
+        TtsCapabilities {
+            named_voices: true,
+            voice_cloning: false,
+            voice_design: false,
+            speed_control: true,
         },
     );
 

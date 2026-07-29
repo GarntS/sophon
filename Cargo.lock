@@ -1669,6 +1669,7 @@ dependencies = [
  "bindgen",
  "cmake",
  "hound",
+ "static_assertions",
  "tempfile",
  "thiserror 2.0.17",
 ]
@@ -2290,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "sophon"
-version = "2026.1.0"
+version = "2026.1.1"
 dependencies = [
  "async-trait",
  "directories",
@@ -2302,6 +2303,7 @@ dependencies = [
  "memfd",
  "ort",
  "pipewire",
+ "qwentts-cpp",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -2324,6 +2326,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strength_reduce"

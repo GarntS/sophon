@@ -77,6 +77,7 @@ pub struct TtsCapabilities {
     pub named_voices: bool,
     pub voice_cloning: bool,
     pub voice_design: bool,
+    pub speed_control: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -127,7 +127,7 @@ impl TtsService {
             return Err(SophonError::OutputExists(path.display().to_string()));
         }
         let audio = self.worker.synthesize(request).await?;
-        let wav = encode_float_wav(&audio, self.config.max_generated_audio_seconds)?;
+        let wav = encode_float_wav(&audio, self.config.operational.max_generated_audio_seconds)?;
         publish_exclusive(path, &wav)
     }
 
@@ -136,7 +136,7 @@ impl TtsService {
         request: TtsRequest,
     ) -> Result<(OwnedFd, u64), SophonError> {
         let audio = self.synthesize(request).await?;
-        let wav = encode_float_wav(&audio, self.config.max_generated_audio_seconds)?;
+        let wav = encode_float_wav(&audio, self.config.operational.max_generated_audio_seconds)?;
         sealed_memfd(&wav)
     }
 
@@ -145,8 +145,8 @@ impl TtsService {
         self.playback
             .play(PlaybackRequest {
                 audio,
-                node_name: self.config.pipewire_node.clone(),
-                volume: self.config.volume as f32,
+                node_name: self.config.operational.pipewire_node.clone(),
+                volume: self.config.operational.volume as f32,
             })
             .await
     }

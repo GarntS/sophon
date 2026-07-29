@@ -44,7 +44,7 @@ The flake SHALL expose checks covering Rust formatting, static analysis, unit/in
 - **THEN** deterministic tests that do not require physical GPU hardware or large model downloads execute and report failure on contract regressions
 
 ### Requirement: Vendored qwentts backend library packages
-The Nix flake SHALL expose named Linux `qwentts-cpp` package outputs for CPU, CUDA, SYCL, and Vulkan builds from the repository's pinned `third_party/qwentts.cpp` source. Each output SHALL select the matching `qwentts-cpp` Cargo acceleration feature and provide its native build and runtime prerequisites; the crate build SHALL produce the qwentts shared library and its required ggml runtime libraries. The flake SHALL NOT require a separately packaged qwentts.cpp library for these crate outputs, and SHALL NOT add qwentts-cpp as a dependency of the Sophon service before a TTS integration exists.
+The Nix flake SHALL continue exposing named Linux `qwentts-cpp` package outputs for CPU, CUDA, SYCL, and Vulkan builds from the repository's pinned `third_party/qwentts.cpp` source. Each output SHALL select the matching `qwentts-cpp` Cargo acceleration feature and provide its native build and runtime prerequisites; the crate build SHALL produce the qwentts shared library and its required ggml runtime libraries. The integrated Sophon packages SHALL also depend on the matching crate backend defined by the service packaging matrix without requiring a separately packaged qwentts.cpp source build.
 
 #### Scenario: qwentts-cpp packages are evaluated
 - **WHEN** a supported Linux system evaluates the named CPU, CUDA, SYCL, or Vulkan qwentts-cpp package output
@@ -64,3 +64,33 @@ The flake SHALL expose deterministic checks for CPU and Vulkan qwentts-cpp packa
 #### Scenario: qwentts-cpp packaging checks run
 - **WHEN** `nix flake check` runs on a supported Linux system
 - **THEN** it verifies CPU and Vulkan qwentts-cpp package build viability and native runtime closure presence, and evaluates the CUDA and SYCL package definitions
+
+### Requirement: Sophon Qwen backend matrix
+Each Sophon Nix package SHALL include exactly one qwentts backend: CPU for `sophon-cpu`, CUDA for `sophon-cuda`, and Vulkan for `sophon-migraphx`. The STT backend SHALL remain CPU, CUDA, and MIGraphX respectively.
+
+#### Scenario: CPU service is built
+- **WHEN** Nix builds `sophon-cpu`
+- **THEN** its service uses CPU/OpenBLAS for Qwen and its closure contains no CUDA, Vulkan, ROCm, or MIGraphX runtime introduced by Qwen
+
+#### Scenario: CUDA service is built
+- **WHEN** Nix builds `sophon-cuda`
+- **THEN** both ONNX STT and Qwen TTS select CUDA and no Vulkan or ROCm runtime is introduced
+
+#### Scenario: MIGraphX service is built
+- **WHEN** Nix builds `sophon-migraphx`
+- **THEN** STT selects MIGraphX while Qwen TTS selects Vulkan and the closure contains both required runtime families
+
+#### Scenario: Conflicting Cargo backends are selected
+- **WHEN** a build enables zero or multiple qwentts backend features
+- **THEN** it fails before native compilation with an actionable feature-selection error
+
+### Requirement: Installed Qwen native runtime
+Integrated Sophon packages SHALL install `libqwen` and every required common and selected-backend GGML shared library, retain their OpenBLAS and accelerator dependencies, and set runtime search paths that do not reference Cargo build directories.
+
+#### Scenario: Installed daemon starts
+- **WHEN** a packaged Sophon daemon with Qwen support starts outside its Nix build directory
+- **THEN** its loader resolves `libqwen` and all transitive GGML backend libraries from the package closure
+
+#### Scenario: Package checks inspect native libraries
+- **WHEN** flake checks validate a Sophon package variant
+- **THEN** they verify required libraries and RPATHs and reject unrelated accelerator dependencies according to the backend matrix

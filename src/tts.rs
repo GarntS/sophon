@@ -13,7 +13,16 @@ use tts_rs::{
     engines::kokoro::{KokoroEngine, KokoroInferenceParams, KokoroModelParams},
 };
 
-use crate::domain::{OwnedAudio, SophonError, TtsCapabilities, TtsRequest, VoiceIntent};
+use crate::{
+    acquisition::{QwenTtsMode, ResolvedQwenModel},
+    config::{QwenSamplingConfig, TtsConfig, TtsProviderConfig},
+    domain::{OwnedAudio, SophonError, TtsCapabilities, TtsRequest, VoiceIntent},
+};
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+use qwentts_cpp::{
+    Language as QwenLanguage, QwenTtsEngine, SamplingOptions as QwenSamplingOptions,
+    Voice as QwenVoice, VoiceReference as QwenVoiceReference,
+};
 
 pub trait TtsProvider: Send {
     fn provider_id(&self) -> &'static str;
@@ -97,6 +106,574 @@ impl KokoroProvider {
     }
 }
 
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+fn validate_qwen_text_like(value: &str, field: &str, max_bytes: u64) -> Result<(), SophonError> {
+    if value.len() as u64 > max_bytes {
+        return Err(SophonError::ResourceLimit(format!(
+            "{field} exceeds max_text_bytes ({max_bytes})"
+        )));
+    }
+    if value.trim().is_empty() {
+        return Err(SophonError::InvalidTtsOptions(format!(
+            "{field} must not be empty"
+        )));
+    }
+    if value.chars().any(|character| {
+        character == '\0' || (character.is_control() && !character.is_whitespace())
+    }) {
+        return Err(SophonError::InvalidTtsOptions(format!(
+            "{field} contains a disallowed control character"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+pub fn normalize_qwen_language(language: Option<&str>) -> Result<QwenLanguage, SophonError> {
+    let Some(language) = language else {
+        return Ok(QwenLanguage::Auto);
+    };
+    let normalized = language.to_ascii_lowercase();
+    match normalized.as_str() {
+        "en" | "en-us" | "en-gb" | "en-au" | "en-ca" => Ok(QwenLanguage::English),
+        "zh" | "zh-cn" | "zh-tw" | "cmn" => Ok(QwenLanguage::Chinese),
+        "ja" | "ja-jp" => Ok(QwenLanguage::Japanese),
+        "ko" | "ko-kr" => Ok(QwenLanguage::Korean),
+        "de" | "de-de" => Ok(QwenLanguage::German),
+        "fr" | "fr-fr" | "fr-ca" => Ok(QwenLanguage::French),
+        "ru" | "ru-ru" => Ok(QwenLanguage::Russian),
+        "pt" | "pt-br" | "pt-pt" => Ok(QwenLanguage::Portuguese),
+        "es" | "es-es" | "es-mx" => Ok(QwenLanguage::Spanish),
+        "it" | "it-it" => Ok(QwenLanguage::Italian),
+        _ => Err(SophonError::InvalidTtsOptions(format!(
+            "language `{language}` is unsupported by Qwen TTS"
+        ))),
+    }
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+pub struct QwenEngineAdapter {
+    engine: QwenTtsEngine,
+    sampling: QwenSamplingOptions,
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+impl QwenEngineAdapter {
+    pub fn load(
+        model: &ResolvedQwenModel,
+        sampling: &QwenSamplingConfig,
+        max_generated_audio_seconds: u64,
+    ) -> Result<Self, SophonError> {
+        let mut engine = QwenTtsEngine::new();
+        engine
+            .load_model(&model.talker_path, &model.codec_path)
+            .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
+        let duration_tokens = engine
+            .duration_sec_to_tokens(max_generated_audio_seconds as f32)
+            .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
+        Ok(Self {
+            engine,
+            sampling: Self::effective_sampling(sampling, duration_tokens)?,
+        })
+    }
+
+    fn effective_sampling(
+        configured: &QwenSamplingConfig,
+        duration_tokens: u32,
+    ) -> Result<QwenSamplingOptions, SophonError> {
+        let seed = configured
+            .seed
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| SophonError::ModelUnavailable("Qwen seed exceeds i64::MAX".into()))?;
+        Ok(QwenSamplingOptions {
+            seed,
+            max_new_tokens: configured.max_new_tokens.min(duration_tokens),
+            temperature: configured.temperature,
+            top_k: configured.top_k,
+            top_p: configured.top_p,
+            repetition_penalty: configured.repetition_penalty,
+        })
+    }
+
+    pub fn speakers(&self) -> Result<Vec<String>, SophonError> {
+        self.engine
+            .speakers()
+            .map_err(|error| SophonError::ModelUnavailable(error.to_string()))
+    }
+
+    pub fn extract_voice_reference(
+        &mut self,
+        samples_24khz_mono: &[f32],
+    ) -> Result<QwenVoiceReference, SophonError> {
+        self.engine
+            .extract_voice_reference(samples_24khz_mono)
+            .map_err(|error| SophonError::SynthesisFailed(error.to_string()))
+    }
+
+    pub fn synthesize(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        voice: QwenVoice<'_>,
+    ) -> Result<OwnedAudio, SophonError> {
+        let result = self
+            .engine
+            .synthesize(
+                text,
+                Some(qwentts_cpp::SynthesisOptions {
+                    language,
+                    sampling: self.sampling.clone(),
+                    voice,
+                }),
+            )
+            .map_err(|error| SophonError::SynthesisFailed(error.to_string()))?;
+        if result.sample_rate != 24_000 {
+            return Err(SophonError::SynthesisFailed(format!(
+                "qwentts.cpp returned unexpected sample rate {}",
+                result.sample_rate
+            )));
+        }
+        Ok(OwnedAudio {
+            samples: result.samples,
+            sample_rate: result.sample_rate,
+        })
+    }
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+trait QwenProviderEngine: Send {
+    fn speakers(&self) -> Result<Vec<String>, SophonError>;
+    fn synthesize_default(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+    ) -> Result<OwnedAudio, SophonError>;
+    fn synthesize_named(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        speaker: &str,
+    ) -> Result<OwnedAudio, SophonError>;
+    fn synthesize_design(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        description: &str,
+    ) -> Result<OwnedAudio, SophonError>;
+    fn synthesize_clone(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        samples_24khz_mono: &[f32],
+        transcript: Option<&str>,
+    ) -> Result<OwnedAudio, SophonError>;
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+impl QwenProviderEngine for QwenEngineAdapter {
+    fn speakers(&self) -> Result<Vec<String>, SophonError> {
+        self.speakers()
+    }
+
+    fn synthesize_default(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+    ) -> Result<OwnedAudio, SophonError> {
+        self.synthesize(text, language, QwenVoice::Default)
+    }
+
+    fn synthesize_named(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        speaker: &str,
+    ) -> Result<OwnedAudio, SophonError> {
+        self.synthesize(text, language, QwenVoice::Named(speaker))
+    }
+
+    fn synthesize_design(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        description: &str,
+    ) -> Result<OwnedAudio, SophonError> {
+        self.synthesize(text, language, QwenVoice::Design(description))
+    }
+
+    fn synthesize_clone(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        samples_24khz_mono: &[f32],
+        transcript: Option<&str>,
+    ) -> Result<OwnedAudio, SophonError> {
+        let reference = self.extract_voice_reference(samples_24khz_mono)?;
+        let voice = match transcript {
+            Some(transcript) => QwenVoice::CloneWithTranscript {
+                reference: &reference,
+                transcript,
+            },
+            None => QwenVoice::Clone(&reference),
+        };
+        self.synthesize(text, language, voice)
+    }
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+pub struct QwenTtsBaseProvider {
+    engine: Box<dyn QwenProviderEngine>,
+    model_id: String,
+    max_text_bytes: u64,
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+impl QwenTtsBaseProvider {
+    pub fn new(
+        engine: QwenEngineAdapter,
+        model_id: impl Into<String>,
+        max_text_bytes: u64,
+    ) -> Self {
+        Self::with_engine(Box::new(engine), model_id, max_text_bytes)
+    }
+
+    fn with_engine(
+        engine: Box<dyn QwenProviderEngine>,
+        model_id: impl Into<String>,
+        max_text_bytes: u64,
+    ) -> Self {
+        Self {
+            engine,
+            model_id: model_id.into(),
+            max_text_bytes,
+        }
+    }
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+pub struct QwenTtsCustomVoiceProvider {
+    engine: Box<dyn QwenProviderEngine>,
+    model_id: String,
+    voices: Vec<String>,
+    default_voice: String,
+    max_text_bytes: u64,
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+impl QwenTtsCustomVoiceProvider {
+    pub fn new(
+        engine: QwenEngineAdapter,
+        model_id: impl Into<String>,
+        default_voice: impl Into<String>,
+        max_text_bytes: u64,
+    ) -> Result<Self, SophonError> {
+        Self::with_engine(Box::new(engine), model_id, default_voice, max_text_bytes)
+    }
+
+    fn with_engine(
+        engine: Box<dyn QwenProviderEngine>,
+        model_id: impl Into<String>,
+        default_voice: impl Into<String>,
+        max_text_bytes: u64,
+    ) -> Result<Self, SophonError> {
+        let voices = engine.speakers()?;
+        let default_voice = default_voice.into();
+        if !voices.iter().any(|voice| voice == &default_voice) {
+            return Err(SophonError::ModelUnavailable(format!(
+                "configured default voice `{default_voice}` is not in the Qwen CustomVoice model"
+            )));
+        }
+        Ok(Self {
+            engine,
+            model_id: model_id.into(),
+            voices,
+            default_voice,
+            max_text_bytes,
+        })
+    }
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+impl TtsProvider for QwenTtsCustomVoiceProvider {
+    fn provider_id(&self) -> &'static str {
+        "qwentts-cpp"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> TtsCapabilities {
+        TtsCapabilities {
+            named_voices: true,
+            voice_cloning: false,
+            voice_design: false,
+            speed_control: false,
+        }
+    }
+
+    fn voices(&self) -> &[String] {
+        &self.voices
+    }
+
+    fn synthesize(&mut self, request: &TtsRequest) -> Result<OwnedAudio, SophonError> {
+        validate_capabilities(self, request)?;
+        validate_qwen_text_like(&request.text, "synthesis text", self.max_text_bytes)?;
+        if request.speed != 1.0 {
+            return Err(SophonError::InvalidTtsOptions(
+                "Qwen TTS supports only unit speed".into(),
+            ));
+        }
+        let language = normalize_qwen_language(request.language.as_deref())?;
+        let speaker = match &request.voice {
+            VoiceIntent::Default => &self.default_voice,
+            VoiceIntent::Named(speaker) => speaker,
+            VoiceIntent::Clone { .. } | VoiceIntent::Design(_) => unreachable!("validated above"),
+        };
+        self.engine
+            .synthesize_named(&request.text, language, speaker)
+    }
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+pub struct QwenTtsVoiceDesignProvider {
+    engine: Box<dyn QwenProviderEngine>,
+    model_id: String,
+    default_voice_description: String,
+    max_text_bytes: u64,
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+impl QwenTtsVoiceDesignProvider {
+    pub fn new(
+        engine: QwenEngineAdapter,
+        model_id: impl Into<String>,
+        default_voice_description: impl Into<String>,
+        max_text_bytes: u64,
+    ) -> Self {
+        Self::with_engine(
+            Box::new(engine),
+            model_id,
+            default_voice_description,
+            max_text_bytes,
+        )
+    }
+
+    fn with_engine(
+        engine: Box<dyn QwenProviderEngine>,
+        model_id: impl Into<String>,
+        default_voice_description: impl Into<String>,
+        max_text_bytes: u64,
+    ) -> Self {
+        Self {
+            engine,
+            model_id: model_id.into(),
+            default_voice_description: default_voice_description.into(),
+            max_text_bytes,
+        }
+    }
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+impl TtsProvider for QwenTtsVoiceDesignProvider {
+    fn provider_id(&self) -> &'static str {
+        "qwentts-cpp"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> TtsCapabilities {
+        TtsCapabilities {
+            named_voices: false,
+            voice_cloning: false,
+            voice_design: true,
+            speed_control: false,
+        }
+    }
+
+    fn voices(&self) -> &[String] {
+        &[]
+    }
+
+    fn synthesize(&mut self, request: &TtsRequest) -> Result<OwnedAudio, SophonError> {
+        validate_capabilities(self, request)?;
+        if request.speed != 1.0 {
+            return Err(SophonError::InvalidTtsOptions(
+                "Qwen TTS supports only unit speed".into(),
+            ));
+        }
+        validate_qwen_text_like(&request.text, "synthesis text", self.max_text_bytes)?;
+        let language = normalize_qwen_language(request.language.as_deref())?;
+        let description = match &request.voice {
+            VoiceIntent::Default => &self.default_voice_description,
+            VoiceIntent::Design(description) => description,
+            VoiceIntent::Named(_) | VoiceIntent::Clone { .. } => unreachable!("validated above"),
+        };
+        validate_qwen_text_like(description, "voice description", self.max_text_bytes)?;
+        self.engine
+            .synthesize_design(&request.text, language, description)
+    }
+}
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+impl TtsProvider for QwenTtsBaseProvider {
+    fn provider_id(&self) -> &'static str {
+        "qwentts-cpp"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> TtsCapabilities {
+        TtsCapabilities {
+            named_voices: false,
+            voice_cloning: true,
+            voice_design: false,
+            speed_control: false,
+        }
+    }
+
+    fn voices(&self) -> &[String] {
+        &[]
+    }
+
+    fn synthesize(&mut self, request: &TtsRequest) -> Result<OwnedAudio, SophonError> {
+        validate_capabilities(self, request)?;
+        if request.speed != 1.0 {
+            return Err(SophonError::InvalidTtsOptions(
+                "Qwen TTS supports only unit speed".into(),
+            ));
+        }
+        validate_qwen_text_like(&request.text, "synthesis text", self.max_text_bytes)?;
+        let language = normalize_qwen_language(request.language.as_deref())?;
+        match &request.voice {
+            VoiceIntent::Default => self.engine.synthesize_default(&request.text, language),
+            VoiceIntent::Clone {
+                reference,
+                transcript,
+            } => {
+                if let Some(transcript) = transcript {
+                    validate_qwen_text_like(transcript, "clone transcript", self.max_text_bytes)?;
+                }
+                if reference.sample_rate != 24_000 {
+                    return Err(SophonError::InvalidTtsOptions(
+                        "Qwen clone references must be 24 kHz mono PCM".into(),
+                    ));
+                }
+                self.engine.synthesize_clone(
+                    &request.text,
+                    language,
+                    &reference.samples,
+                    transcript.as_deref(),
+                )
+            }
+            VoiceIntent::Named(_) | VoiceIntent::Design(_) => unreachable!("validated above"),
+        }
+    }
+}
+
+pub enum TtsProviderModel {
+    KokoroDirectory(PathBuf),
+    Qwen(ResolvedQwenModel),
+}
+
+pub fn create_tts_provider(
+    config: &TtsConfig,
+    model: TtsProviderModel,
+    optimized_model_cache_path: Option<PathBuf>,
+) -> Result<Box<dyn TtsProvider>, SophonError> {
+    match (&config.provider, model) {
+        (
+            TtsProviderConfig::Kokoro {
+                model_id,
+                default_voice,
+            },
+            TtsProviderModel::KokoroDirectory(model_dir),
+        ) => Ok(Box::new(KokoroProvider::load(
+            &model_dir,
+            model_id,
+            default_voice,
+            optimized_model_cache_path,
+        )?)),
+        (variant, TtsProviderModel::Qwen(model)) => {
+            let (model_id, expected_mode, sampling) = match variant {
+                TtsProviderConfig::QwenBase { model_id, sampling } => {
+                    (model_id, QwenTtsMode::Base, sampling)
+                }
+                TtsProviderConfig::QwenCustomVoice {
+                    model_id, sampling, ..
+                } => (model_id, QwenTtsMode::CustomVoice, sampling),
+                TtsProviderConfig::QwenVoiceDesign {
+                    model_id, sampling, ..
+                } => (model_id, QwenTtsMode::VoiceDesign, sampling),
+                TtsProviderConfig::Kokoro { .. } => {
+                    return Err(SophonError::ModelUnavailable(
+                        "Kokoro configuration cannot load Qwen artifacts".into(),
+                    ));
+                }
+            };
+            if model.definition.id != model_id || model.metadata.mode != expected_mode {
+                return Err(SophonError::ModelUnavailable(format!(
+                    "typed TTS configuration does not match resolved model `{}`",
+                    model.definition.id
+                )));
+            }
+            #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+            {
+                let engine = QwenEngineAdapter::load(
+                    &model,
+                    sampling,
+                    config.operational.max_generated_audio_seconds,
+                )?;
+                let provider: Box<dyn TtsProvider> = match variant {
+                    TtsProviderConfig::QwenBase { .. } => Box::new(QwenTtsBaseProvider::new(
+                        engine,
+                        model_id,
+                        config.operational.max_text_bytes,
+                    )),
+                    TtsProviderConfig::QwenCustomVoice { default_voice, .. } => {
+                        Box::new(QwenTtsCustomVoiceProvider::new(
+                            engine,
+                            model_id,
+                            default_voice,
+                            config.operational.max_text_bytes,
+                        )?)
+                    }
+                    TtsProviderConfig::QwenVoiceDesign {
+                        default_voice_description,
+                        ..
+                    } => Box::new(QwenTtsVoiceDesignProvider::new(
+                        engine,
+                        model_id,
+                        default_voice_description,
+                        config.operational.max_text_bytes,
+                    )),
+                    TtsProviderConfig::Kokoro { .. } => unreachable!(),
+                };
+                Ok(provider)
+            }
+            #[cfg(not(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan")))]
+            {
+                let _ = sampling;
+                Err(SophonError::ModelUnavailable(
+                    "this Sophon build has no Qwen backend".into(),
+                ))
+            }
+        }
+        (TtsProviderConfig::QwenBase { .. }, TtsProviderModel::KokoroDirectory(_))
+        | (TtsProviderConfig::QwenCustomVoice { .. }, TtsProviderModel::KokoroDirectory(_))
+        | (TtsProviderConfig::QwenVoiceDesign { .. }, TtsProviderModel::KokoroDirectory(_)) => {
+            Err(SophonError::ModelUnavailable(
+                "Qwen configuration requires resolved talker and codec artifacts".into(),
+            ))
+        }
+    }
+}
+
 impl TtsProvider for KokoroProvider {
     fn provider_id(&self) -> &'static str {
         "tts-rs"
@@ -111,6 +688,7 @@ impl TtsProvider for KokoroProvider {
             named_voices: true,
             voice_cloning: false,
             voice_design: false,
+            speed_control: true,
         }
     }
 
@@ -286,6 +864,84 @@ mod tests {
         time::Duration,
     };
 
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    #[derive(Debug, PartialEq)]
+    enum QwenCall {
+        Default(QwenLanguage),
+        Named(QwenLanguage, String),
+        Design(QwenLanguage, String),
+        Clone(QwenLanguage, Vec<f32>, Option<String>),
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    struct FixtureQwenEngine {
+        calls: Arc<Mutex<Vec<QwenCall>>>,
+        speakers: Vec<String>,
+        fail_once: bool,
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    impl FixtureQwenEngine {
+        fn respond(&mut self, call: QwenCall) -> Result<OwnedAudio, SophonError> {
+            self.calls.lock().unwrap().push(call);
+            if self.fail_once {
+                self.fail_once = false;
+                return Err(SophonError::SynthesisFailed("fixture failure".into()));
+            }
+            Ok(OwnedAudio {
+                samples: vec![0.25],
+                sample_rate: 24_000,
+            })
+        }
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    impl QwenProviderEngine for FixtureQwenEngine {
+        fn speakers(&self) -> Result<Vec<String>, SophonError> {
+            Ok(self.speakers.clone())
+        }
+
+        fn synthesize_default(
+            &mut self,
+            _: &str,
+            language: QwenLanguage,
+        ) -> Result<OwnedAudio, SophonError> {
+            self.respond(QwenCall::Default(language))
+        }
+
+        fn synthesize_named(
+            &mut self,
+            _: &str,
+            language: QwenLanguage,
+            speaker: &str,
+        ) -> Result<OwnedAudio, SophonError> {
+            self.respond(QwenCall::Named(language, speaker.into()))
+        }
+
+        fn synthesize_design(
+            &mut self,
+            _: &str,
+            language: QwenLanguage,
+            description: &str,
+        ) -> Result<OwnedAudio, SophonError> {
+            self.respond(QwenCall::Design(language, description.into()))
+        }
+
+        fn synthesize_clone(
+            &mut self,
+            _: &str,
+            language: QwenLanguage,
+            samples: &[f32],
+            transcript: Option<&str>,
+        ) -> Result<OwnedAudio, SophonError> {
+            self.respond(QwenCall::Clone(
+                language,
+                samples.to_vec(),
+                transcript.map(str::to_owned),
+            ))
+        }
+    }
+
     struct FixtureProvider {
         calls: Arc<Mutex<Vec<TtsRequest>>>,
         fail_first: bool,
@@ -331,6 +987,7 @@ mod tests {
             named_voices: true,
             voice_cloning: false,
             voice_design: false,
+            speed_control: true,
         }
     }
 
@@ -350,6 +1007,314 @@ mod tests {
             capabilities: capabilities(),
             voices: vec!["af_heart".into(), "am_adam".into()],
         })
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    #[test]
+    fn qwen_language_normalization_is_conservative_and_case_insensitive() {
+        assert_eq!(normalize_qwen_language(None).unwrap(), QwenLanguage::Auto);
+        for (tag, expected) in [
+            ("EN-us", QwenLanguage::English),
+            ("zh-CN", QwenLanguage::Chinese),
+            ("ja-JP", QwenLanguage::Japanese),
+            ("ko-KR", QwenLanguage::Korean),
+            ("de-DE", QwenLanguage::German),
+            ("fr-CA", QwenLanguage::French),
+            ("ru-RU", QwenLanguage::Russian),
+            ("pt-BR", QwenLanguage::Portuguese),
+            ("es-MX", QwenLanguage::Spanish),
+            ("it-IT", QwenLanguage::Italian),
+        ] {
+            assert_eq!(normalize_qwen_language(Some(tag)).unwrap(), expected);
+        }
+        for unsupported in ["", "en-US-extra", "ar", "en_US", " english "] {
+            assert!(matches!(
+                normalize_qwen_language(Some(unsupported)),
+                Err(SophonError::InvalidTtsOptions(_))
+            ));
+        }
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    #[test]
+    fn qwen_base_supports_default_and_temporary_one_shot_clone_references() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = QwenTtsBaseProvider::with_engine(
+            Box::new(FixtureQwenEngine {
+                calls: calls.clone(),
+                speakers: Vec::new(),
+                fail_once: false,
+            }),
+            "qwen-base-fixture",
+            1024,
+        );
+        assert_eq!(provider.provider_id(), "qwentts-cpp");
+        assert!(provider.capabilities().voice_cloning);
+        assert!(!provider.capabilities().named_voices);
+        assert!(
+            provider
+                .synthesize(&TtsRequest {
+                    text: "hello".into(),
+                    language: None,
+                    speed: 1.0,
+                    voice: VoiceIntent::Default,
+                })
+                .is_ok()
+        );
+        assert!(
+            provider
+                .synthesize(&TtsRequest {
+                    text: "clone".into(),
+                    language: Some("EN-us".into()),
+                    speed: 1.0,
+                    voice: VoiceIntent::Clone {
+                        reference: OwnedAudio {
+                            samples: vec![0.1, -0.1],
+                            sample_rate: 24_000,
+                        },
+                        transcript: Some("reference words".into()),
+                    },
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                QwenCall::Default(QwenLanguage::Auto),
+                QwenCall::Clone(
+                    QwenLanguage::English,
+                    vec![0.1, -0.1],
+                    Some("reference words".into())
+                ),
+            ]
+        );
+        assert!(matches!(
+            provider.synthesize(&TtsRequest {
+                text: "bad speed".into(),
+                language: None,
+                speed: 1.1,
+                voice: VoiceIntent::Default,
+            }),
+            Err(SophonError::InvalidTtsOptions(_))
+        ));
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    #[test]
+    fn qwen_custom_voice_enumerates_validates_and_synthesizes_named_speakers() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let engine = || FixtureQwenEngine {
+            calls: calls.clone(),
+            speakers: vec!["vivian".into(), "ryan".into()],
+            fail_once: false,
+        };
+        assert!(matches!(
+            QwenTtsCustomVoiceProvider::with_engine(
+                Box::new(engine()),
+                "qwen-custom-fixture",
+                "missing",
+                1024,
+            ),
+            Err(SophonError::ModelUnavailable(_))
+        ));
+        let mut provider = QwenTtsCustomVoiceProvider::with_engine(
+            Box::new(engine()),
+            "qwen-custom-fixture",
+            "vivian",
+            1024,
+        )
+        .unwrap();
+        assert_eq!(provider.voices(), ["vivian", "ryan"]);
+        assert!(provider.capabilities().named_voices);
+        for voice in [VoiceIntent::Default, VoiceIntent::Named("ryan".into())] {
+            provider
+                .synthesize(&TtsRequest {
+                    text: "hello".into(),
+                    language: Some("zh-CN".into()),
+                    speed: 1.0,
+                    voice,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                QwenCall::Named(QwenLanguage::Chinese, "vivian".into()),
+                QwenCall::Named(QwenLanguage::Chinese, "ryan".into()),
+            ]
+        );
+        assert!(matches!(
+            provider.synthesize(&TtsRequest {
+                text: "hello".into(),
+                language: None,
+                speed: 1.0,
+                voice: VoiceIntent::Named("missing".into()),
+            }),
+            Err(SophonError::InvalidTtsOptions(_))
+        ));
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    #[test]
+    fn qwen_voice_design_uses_configured_default_and_request_override() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = QwenTtsVoiceDesignProvider::with_engine(
+            Box::new(FixtureQwenEngine {
+                calls: calls.clone(),
+                speakers: Vec::new(),
+                fail_once: false,
+            }),
+            "qwen-design-fixture",
+            "warm default",
+            1024,
+        );
+        assert!(provider.capabilities().voice_design);
+        for voice in [
+            VoiceIntent::Default,
+            VoiceIntent::Design("bright override".into()),
+        ] {
+            provider
+                .synthesize(&TtsRequest {
+                    text: "hello".into(),
+                    language: Some("it-IT".into()),
+                    speed: 1.0,
+                    voice,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                QwenCall::Design(QwenLanguage::Italian, "warm default".into()),
+                QwenCall::Design(QwenLanguage::Italian, "bright override".into()),
+            ]
+        );
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    #[test]
+    fn qwen_providers_apply_independent_limits_and_recover_after_native_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut base = QwenTtsBaseProvider::with_engine(
+            Box::new(FixtureQwenEngine {
+                calls: calls.clone(),
+                speakers: Vec::new(),
+                fail_once: true,
+            }),
+            "qwen-base-fixture",
+            4,
+        );
+        let default_request = |text: &str| TtsRequest {
+            text: text.into(),
+            language: None,
+            speed: 1.0,
+            voice: VoiceIntent::Default,
+        };
+        assert!(matches!(
+            base.synthesize(&default_request("oversize")),
+            Err(SophonError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            base.synthesize(&TtsRequest {
+                text: "okay".into(),
+                language: None,
+                speed: 1.0,
+                voice: VoiceIntent::Clone {
+                    reference: OwnedAudio {
+                        samples: vec![0.0],
+                        sample_rate: 24_000,
+                    },
+                    transcript: Some("large".into()),
+                },
+            }),
+            Err(SophonError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            base.synthesize(&default_request("fail")),
+            Err(SophonError::SynthesisFailed(_))
+        ));
+        assert!(base.synthesize(&default_request("okay")).is_ok());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                QwenCall::Default(QwenLanguage::Auto),
+                QwenCall::Default(QwenLanguage::Auto)
+            ]
+        );
+
+        let design_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut design = QwenTtsVoiceDesignProvider::with_engine(
+            Box::new(FixtureQwenEngine {
+                calls: design_calls.clone(),
+                speakers: Vec::new(),
+                fail_once: false,
+            }),
+            "qwen-design-fixture",
+            "voice",
+            5,
+        );
+        assert!(design.synthesize(&default_request("hello")).is_ok());
+        assert!(matches!(
+            design.synthesize(&TtsRequest {
+                voice: VoiceIntent::Design("voices".into()),
+                ..default_request("hello")
+            }),
+            Err(SophonError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn typed_provider_factory_rejects_mismatched_configuration_and_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::config::ConfigPaths::from_homes(
+            root.path().join("config"),
+            root.path().join("cache"),
+        );
+        let mut config = crate::config::Config::load(&paths).unwrap().tts.unwrap();
+        let definition = &crate::acquisition::QWEN_06B_BASE;
+        let resolved = ResolvedQwenModel {
+            definition,
+            metadata: definition.qwen.unwrap(),
+            talker_path: root.path().join("talker.gguf"),
+            codec_path: root.path().join("codec.gguf"),
+        };
+        assert!(matches!(
+            create_tts_provider(&config, TtsProviderModel::Qwen(resolved), None),
+            Err(SophonError::ModelUnavailable(_))
+        ));
+
+        config.provider = TtsProviderConfig::QwenBase {
+            model_id: definition.id.into(),
+            sampling: QwenSamplingConfig::default(),
+        };
+        assert!(matches!(
+            create_tts_provider(
+                &config,
+                TtsProviderModel::KokoroDirectory(root.path().into()),
+                None,
+            ),
+            Err(SophonError::ModelUnavailable(_))
+        ));
+    }
+
+    #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+    #[test]
+    fn qwen_adapter_applies_sampling_and_native_duration_token_caps() {
+        let configured = QwenSamplingConfig {
+            seed: Some(42),
+            max_new_tokens: 2048,
+            temperature: 0.7,
+            top_k: 25,
+            top_p: 0.8,
+            repetition_penalty: 1.1,
+        };
+        let effective = QwenEngineAdapter::effective_sampling(&configured, 750).unwrap();
+        assert_eq!(effective.seed, Some(42));
+        assert_eq!(effective.max_new_tokens, 750);
+        assert_eq!(effective.temperature, 0.7);
+        assert_eq!(effective.top_k, 25);
+        assert_eq!(effective.top_p, 0.8);
+        assert_eq!(effective.repetition_penalty, 1.1);
     }
 
     #[test]

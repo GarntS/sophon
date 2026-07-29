@@ -12,9 +12,22 @@ use crate::{
     postprocess::{IdentityProcessor, PostProcessingPipeline},
     service::{TranscriptionService, TtsService},
     transport::{BUS_NAME, OBJECT_PATH},
-    tts::{KokoroProvider, TtsProvider, TtsWorker},
+    tts::{TtsProviderModel, TtsWorker, create_tts_provider},
     worker::ModelWorker,
 };
+
+#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
+fn install_qwen_log_bridge() {
+    qwentts_cpp::set_log_callback(Some(Arc::new(|level, message| match level {
+        qwentts_cpp::LogLevel::Debug => tracing::debug!(target: "qwentts_cpp", "{message}"),
+        qwentts_cpp::LogLevel::Info => tracing::info!(target: "qwentts_cpp", "{message}"),
+        qwentts_cpp::LogLevel::Warning => tracing::warn!(target: "qwentts_cpp", "{message}"),
+        qwentts_cpp::LogLevel::Error => tracing::error!(target: "qwentts_cpp", "{message}"),
+    })));
+}
+
+#[cfg(not(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan")))]
+fn install_qwen_log_bridge() {}
 
 /// Starts the session-bus service and claims its name before model work begins.
 pub fn run() {
@@ -76,37 +89,59 @@ async fn initialize_tts(
     config: TtsConfig,
     lifecycle: TtsLifecycle,
 ) -> Result<(Arc<TtsService>, Vec<String>, TtsCapabilities), SophonError> {
-    let model_dir =
-        match acquisition::resolve_tts_location(&config.model_id, config.model_path.as_deref())? {
-            TtsModelLocation::LocalOverride(path) => path,
-            TtsModelLocation::Registry(model) => {
-                if let Some(path) = acquisition::validated_cache(&config.cache_dir, model) {
-                    path
-                } else if config.automatic_download {
-                    let progress = lifecycle.clone();
-                    lifecycle.downloading(0.0);
-                    acquisition::acquire(&config.cache_dir, model, move |value| {
-                        progress.downloading(value)
-                    })
-                    .await?
-                } else {
-                    return Err(SophonError::ModelUnavailable(
-                        "TTS model is not cached and automatic downloads are disabled".into(),
-                    ));
-                }
+    let provider_model = match acquisition::resolve_tts_location(
+        config.provider_id(),
+        config.model_id(),
+        config.operational.model_path.as_deref(),
+    )? {
+        TtsModelLocation::LocalOverride(path) => {
+            if config.provider_id() == "qwentts-cpp" {
+                TtsProviderModel::Qwen(acquisition::resolve_qwen_override(
+                    &path,
+                    config.provider_id(),
+                    config.model_id(),
+                )?)
+            } else {
+                TtsProviderModel::KokoroDirectory(path)
             }
-        };
-    lifecycle.loading(config.provider.clone(), config.model_id.clone());
-    let optimized_dir = config.cache_dir.join("optimized");
+        }
+        TtsModelLocation::Registry(model) => {
+            let model_dir = if let Some(path) =
+                acquisition::validated_cache(&config.operational.cache_dir, model)
+            {
+                path
+            } else if config.operational.automatic_download {
+                let progress = lifecycle.clone();
+                lifecycle.downloading(0.0);
+                acquisition::acquire(&config.operational.cache_dir, model, move |value| {
+                    progress.downloading(value)
+                })
+                .await?
+            } else {
+                return Err(SophonError::ModelUnavailable(
+                    "TTS model is not cached and automatic downloads are disabled".into(),
+                ));
+            };
+            if model.qwen.is_some() {
+                TtsProviderModel::Qwen(acquisition::resolve_qwen_model(
+                    &config.operational.cache_dir,
+                    config.provider_id(),
+                    config.model_id(),
+                )?)
+            } else {
+                TtsProviderModel::KokoroDirectory(model_dir)
+            }
+        }
+    };
+    lifecycle.loading(config.provider_id(), config.model_id());
+    let optimized_dir = config.operational.cache_dir.join("optimized");
     std::fs::create_dir_all(&optimized_dir)
         .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
-    let model_id = config.model_id.clone();
-    let default_voice = config.default_voice.clone();
+    let provider_config = config.clone();
     let provider = tokio::task::spawn_blocking(move || {
-        KokoroProvider::load(
-            &model_dir,
-            model_id,
-            default_voice,
+        create_tts_provider(
+            &provider_config,
+            provider_model,
             Some(optimized_dir.join("kokoro-v1.0-int8.optimized.onnx")),
         )
     })
@@ -115,17 +150,20 @@ async fn initialize_tts(
     let voices = provider.voices().to_vec();
     let capabilities = provider.capabilities();
     let worker = TtsWorker::new(
-        Box::new(provider),
-        config.queue_capacity,
-        config.max_generated_audio_seconds,
+        provider,
+        config.operational.queue_capacity,
+        config.operational.max_generated_audio_seconds,
     );
-    let playback =
-        PlaybackWorker::new(Box::new(PipeWirePlayback::default()), config.queue_capacity);
+    let playback = PlaybackWorker::new(
+        Box::new(PipeWirePlayback::default()),
+        config.operational.queue_capacity,
+    );
     let service = Arc::new(TtsService::new(lifecycle, worker, playback, config));
     Ok((service, voices, capabilities))
 }
 
 async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
+    install_qwen_log_bridge();
     let lifecycle = ModelLifecycle::new();
     // Claim the name with safe defaults; configuration and model work follows in
     // a background task so activation clients can observe readiness immediately.

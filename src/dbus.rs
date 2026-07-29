@@ -379,6 +379,9 @@ impl SophonDbus {
         if capabilities.voice_design {
             values.push("voice-design".into());
         }
+        if capabilities.speed_control {
+            values.push("speed-control".into());
+        }
         values
     }
 

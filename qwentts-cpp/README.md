@@ -60,11 +60,32 @@ releases the old native context, and `Drop` releases the final context.
 `SynthesisResult` owns its f32 samples and remains usable after the engine is
 unloaded or dropped.
 
+An exclusively owned engine is `Send`, so it may be loaded on one thread and
+moved to a dedicated worker thread. It is deliberately not `Sync`: every safe
+operation that can mutate or synthesize through the native context requires
+exclusive Rust access. This contract relies on the pinned qwentts.cpp ABI's
+thread-safe context and serialized GPU-access guarantees.
+
+A loaded engine's `duration_sec_to_tokens` method converts a finite positive
+audio-duration limit into the model's native generation-token count. It rejects
+invalid or out-of-range durations and returns `ModelNotLoaded` without calling
+native code when no model is loaded.
+
 `SynthesisOptions` supports language and sampling settings plus `Voice` modes:
 default, a named CustomVoice speaker, a clone `VoiceReference`, a clone with a
 transcript, and a VoiceDesign instruction. Extract clone references from mono
 24 kHz f32 PCM with `extract_voice_reference`; they automatically release their
 native storage when dropped.
+
+## Native logging
+
+`set_log_callback` installs or replaces one process-wide `LogCallback`; passing
+`None` restores qwentts.cpp's default logger. Native debug, info, warning, and
+error severities map to `LogLevel`. The callback can run reentrantly from a
+caller thread or any qwentts.cpp worker thread, so it must be `Send + Sync +
+'static` and must not assume engine-local thread affinity. Each message is
+copied and converted to valid UTF-8 before invocation, and callback panics are
+contained before they can unwind across the C ABI.
 
 This initial wrapper deliberately has no streaming API and no provider-neutral
 abstraction. Higher-level Sophon integration belongs above this Qwen-specific

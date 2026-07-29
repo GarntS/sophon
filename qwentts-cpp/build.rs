@@ -146,9 +146,7 @@ fn stage_and_link_libraries(build_dir: &Path, out_dir: &Path) -> PathBuf {
         println!("cargo:rustc-link-lib=dylib={library}");
     }
 
-    if cfg!(target_os = "linux") {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
-    } else if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     }
 
