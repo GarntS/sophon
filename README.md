@@ -241,6 +241,36 @@ tests/pipewire-smoke.sh
 
 It starts an isolated PipeWire daemon, creates an exact-name null sink, negotiates mono float audio, and waits for complete stream drain.
 
+## Benchmarks
+
+A manually-run, black-box benchmark harness lives in `bench/` (Python, managed by [`uv`](https://docs.astral.sh/uv/)). It attaches to the already-running daemon on the session bus, discovers the active engine, model, TTS provider, and capabilities from the lifecycle properties, waits for readiness, and measures what a real client experiences. It never starts, stops, or reconfigures the daemon.
+
+```sh
+uv run --directory bench sophon-bench [--wav-dir DIR] [--jsonl PATH] \
+    [--warmup N] [--reps N] [--timeout SECONDS] [--keep-outputs]
+```
+
+Each run measures three things, sequentially:
+
+- **IPC/validation baseline**: timed calls the daemon rejects before inference is queued (a nonexistent audio path, an unknown TTS option key). This is the transport floor every other number includes. Each baseline call is verified to fail with the expected error type.
+- **STT sweep**: `TranscribeFile` latency over a corpus bucketed around ~1s/3s/10s/30s durations, with per-call real-time factor (RTF = audio duration / call latency).
+- **TTS sweep**: the three embedded text lengths (sentence / paragraph / page) through both `SpeakToFile` and `SpeakToBuffer`, with per-call RTF = call latency / generated audio duration. Buffer cells are skipped with a notice when Unix FD passing cannot be negotiated.
+
+The first post-ready inference in each STT/TTS sweep is recorded separately. Every cell then runs `--warmup` calls (default 3) followed by `--reps` measured repetitions (default 15). The report prints n, min, p50, p90, p99, max, mean, standard deviation, and median RTF per cell; first-call and warmup data never appear in measured distributions. `--jsonl` writes a manifest record (platform, CPU model, discovered daemon configuration, timestamp, harness version) followed by one record per measured call. Generated speech files land in a run-scoped directory removed on completion unless `--keep-outputs` is passed; Ctrl-C keeps partial results.
+
+### STT corpus
+
+`--wav-dir` supplies the audio corpus directly. Files must be 16 kHz mono 16-bit PCM WAV (the daemon's own input constraint); violating files are rejected with a message naming the constraint, and accepted files must span at least three duration buckets. Without `--wav-dir`, the harness synthesizes a corpus through the daemon's own TTS, resamples it to 16 kHz mono with `ffmpeg` or `sox` (whichever is on PATH — an optional runtime detection, never a hard dependency), and caches it under `$XDG_CACHE_HOME/sophon/bench-corpus` for reuse. With neither a corpus nor a way to make one, the STT sweep is skipped with an actionable message; TTS results still stand.
+
+### Reading the numbers
+
+All latencies are **end-to-end** and client-measured: bus round trip, queueing, inference, and output. The `baseline/*` rows identify the transport floor (no inference), so inference cost is roughly a cell's latency minus the baseline. Compare medians before tails; treat p90/p99 as promises about bad days. Caveats:
+
+- Run on an idle machine. CPU governor state and background load inflate variance, and the harness makes no attempt to control them.
+- Black-box measurement cannot attribute time between queue wait and inference; sequential single-client runs keep queue wait near zero by construction.
+- Qwen TTS generation is nondeterministic, so output length (and hence RTF) varies call to call; a configured `seed` makes TTS runs more reproducible.
+- Long texts on CPU Qwen are slow (minutes per call); reduce `--reps` for a quicker pass.
+
 ## Etymology
 
 A Sophon is fictional technology from *Remembrance of Earth's Past* by Cixin Liu, translated by Ken Liu. In *The Three-Body Problem*, Sophons are used to communicate covertly with human scientists and stall scientific progress on Earth.

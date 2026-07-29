@@ -3,3 +3,8 @@ target/
 
 # nix build target
 result
+
+# python / uv (bench harness)
+bench/.venv/
+__pycache__/
+*.egg-info/

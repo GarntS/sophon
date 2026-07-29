@@ -1,0 +1,181 @@
+{"type": "manifest", "harness": "sophon-bench", "version": "0.1.0", "timestamp": "2026-07-29T18:52:16.882843+00:00", "platform": {"system": "Linux", "release": "6.18.39", "machine": "x86_64", "python": "3.13.14"}, "cpu_model": "Intel(R) Core(TM) i7-14700K", "daemon": {"engine": "parakeet", "model": "parakeet-tdt-0.6b-v3-int8", "tts_provider": "qwentts-cpp", "tts_model": "qwen3-tts-0.6b-base-q8_0", "tts_capabilities": ["voice-cloning"]}, "fd_passing": true, "parameters": {"warmup": 3, "reps": 15}}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000255563, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000129579, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000117932, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000111638, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000117835, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000116864, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000109663, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000110833, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000105306, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000105762, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000105728, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000113641, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000115249, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000110906, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-audio", "kind": "measured", "first": false, "axes": {"rejection": "invalid-audio"}, "latency_s": 0.000107188, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000119512, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000182823, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000236946, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000132361, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000126461, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000121137, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.0001159, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000114275, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000120852, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000120985, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000226698, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000113972, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000110863, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000112567, "rtf": null}
+{"type": "call", "cell": "baseline/invalid-tts-options", "kind": "measured", "first": false, "axes": {"rejection": "invalid-tts-options"}, "latency_s": 0.000117601, "rtf": null}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.445300341, "rtf": 2.515156394187446}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.371592379, "rtf": 3.014055355532467}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.396954862, "rtf": 2.8214794859975796}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.460883064, "rtf": 2.430117501562175}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.357920969, "rtf": 3.129182408980347}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.487019806, "rtf": 2.299701133715289}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.797870934, "rtf": 1.4037358077265165}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.38593895, "rtf": 2.902013388386946}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.575970038, "rtf": 1.9445455945748347}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.698859659, "rtf": 1.6026107467736954}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.585902293, "rtf": 1.9115815271267427}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.7078546, "rtf": 1.5822458454038444}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.675922393, "rtf": 1.6569949621420519}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.475929251, "rtf": 2.353290951641886}
+{"type": "call", "cell": "stt/1s", "kind": "measured", "first": false, "axes": {"target_s": 1.0, "duration_s": 1.12, "file": "1s.wav"}, "latency_s": 0.613006569, "rtf": 1.8270603556941658}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.578180108, "rtf": 2.12903456517271}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.011628559, "rtf": 3.3213771696217997}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.309174997, "rtf": 2.5665018104527704}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.470759857, "rtf": 2.2845333886482324}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.311813103, "rtf": 2.5613404777829847}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 0.975959058, "rtf": 3.442767370677961}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.205825764, "rtf": 2.7864722253521195}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.345947355, "rtf": 2.496382928736466}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 0.810939577, "rtf": 4.143341989091254}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 0.955937646, "rtf": 3.514873605051014}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 0.890970994, "rtf": 3.771166539233038}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.051948773, "rtf": 3.1940718847152456}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.28284809, "rtf": 2.619172157788378}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.107938196, "rtf": 3.0326601358547256}
+{"type": "call", "cell": "stt/3s", "kind": "measured", "first": false, "axes": {"target_s": 3.0, "duration_s": 3.36, "file": "3s.wav"}, "latency_s": 1.244939115, "rtf": 2.698927168016566}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 1.971624731, "rtf": 5.883472558247191}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 2.104226574, "rtf": 5.5127143356759065}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 1.527938484, "rtf": 7.591928681338194}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 2.037960495, "rtf": 5.691965093759091}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 1.744750459, "rtf": 6.648515230452219}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 1.860082079, "rtf": 6.236283941962541}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 1.566583165, "rtf": 7.404649979115536}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 2.09628055, "rtf": 5.5336104702206965}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 1.871915853, "rtf": 6.196859747413016}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 1.455976763, "rtf": 7.96716011874978}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 2.126981181, "rtf": 5.4537388969968505}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 2.015870647, "rtf": 5.754337470642282}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 2.015923453, "rtf": 5.754186738954517}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 1.95692378, "rtf": 5.927670826300655}
+{"type": "call", "cell": "stt/10s", "kind": "measured", "first": false, "axes": {"target_s": 10.0, "duration_s": 11.6, "file": "10s.wav"}, "latency_s": 2.05795828, "rtf": 5.636654597293392}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 2.924916509, "rtf": 10.092595774671393}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.405935573, "rtf": 8.667222079599801}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 2.721935591, "rtf": 10.845223559884008}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 2.816901962, "rtf": 10.479597940654207}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.302977765, "rtf": 8.9373898646272}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.114876562, "rtf": 9.477101070434006}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.230017505, "rtf": 9.139269355136204}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.057891487, "rtf": 9.653710776035789}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.507958462, "rtf": 8.415150954544}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.410901832, "rtf": 8.654602639997643}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 2.920927912, "rtf": 10.106377455850065}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.673933436, "rtf": 8.034984986592447}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 3.150938668, "rtf": 9.3686368128318}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 2.787911534, "rtf": 10.58857127996659}
+{"type": "call", "cell": "stt/30s", "kind": "measured", "first": false, "axes": {"target_s": 30.0, "duration_s": 29.52, "file": "30s.wav"}, "latency_s": 2.789932934, "rtf": 10.580899504876772}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.409507346, "rtf": 0.12484028534410486}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.386626102, "rtf": 0.1271691808239454}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.381124874, "rtf": 0.12535971515500371}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.403717784, "rtf": 0.12615195187875947}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.32621539, "rtf": 0.127415443804316}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.423387694, "rtf": 0.12907177623656732}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.484000867, "rtf": 0.12346173509342517}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.379832852, "rtf": 0.12493474286654059}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.33492945, "rtf": 0.1268552031057665}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.341489631, "rtf": 0.12553612020953958}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.371923591, "rtf": 0.12912892665567224}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.463038742, "rtf": 0.12314041406821355}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.337078111, "rtf": 0.13165827985548287}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.374459769, "rtf": 0.13372369217034194}
+{"type": "call", "cell": "tts/sentence/file", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "file"}, "latency_s": 0.481682194, "rtf": 0.1254299053447041}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.42730893, "rtf": 0.1405505895896719}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.42289436, "rtf": 0.1258520526746522}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.430627374, "rtf": 0.12232863404587743}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.388626191, "rtf": 0.1278270507359592}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.390885027, "rtf": 0.12857002779376697}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.427604939, "rtf": 0.13035742367197622}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.368930173, "rtf": 0.1280896356219078}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.372360798, "rtf": 0.12578694299467952}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.478622848, "rtf": 0.12463325252262222}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.478945186, "rtf": 0.12471718924549183}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.441745293, "rtf": 0.12269850510381224}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.408105442, "rtf": 0.12441290816248761}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.377149402, "rtf": 0.13468418962592626}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.381247516, "rtf": 0.13614767110079457}
+{"type": "call", "cell": "tts/sentence/buffer", "kind": "measured", "first": false, "axes": {"length": "sentence", "chars": 44, "mode": "buffer"}, "latency_s": 0.471731477, "rtf": 0.1371212781047889}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 1.781528776, "rtf": 0.12168704605454142}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.093620736, "rtf": 0.12115685455939586}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.125098148, "rtf": 0.1241277521064237}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 1.850752417, "rtf": 0.12371132948981467}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.214088783, "rtf": 0.12245896948327595}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.090223784, "rtf": 0.12040286194035224}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.133524142, "rtf": 0.12520497891756283}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.088253295, "rtf": 0.12549410585778456}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 1.901403038, "rtf": 0.12575208994560275}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 1.908714328, "rtf": 0.12426323321560521}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.061235526, "rtf": 0.1244688652647152}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.146828274, "rtf": 0.123096186923926}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.030800201, "rtf": 0.12204144775469117}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 1.913147424, "rtf": 0.12139067743214733}
+{"type": "call", "cell": "tts/paragraph/file", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "file"}, "latency_s": 2.230363814, "rtf": 0.12227704192650868}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.328194846, "rtf": 0.12598286527509098}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.149431436, "rtf": 0.12438659371247524}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.352009595, "rtf": 0.12352829374614305}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 1.910441195, "rtf": 0.12373123459788539}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.165243161, "rtf": 0.12888160360708917}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.038641911, "rtf": 0.12491487023789463}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.050053691, "rtf": 0.12877019462634068}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.201719297, "rtf": 0.12800507533320735}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.21276706, "rtf": 0.1280517967043301}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.13085974, "rtf": 0.12805455086311804}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 1.951620929, "rtf": 0.1277217930989349}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.094273295, "rtf": 0.12707776247326344}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 1.844681438, "rtf": 0.12669297834858606}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.125822939, "rtf": 0.12133519436081104}
+{"type": "call", "cell": "tts/paragraph/buffer", "kind": "measured", "first": false, "axes": {"length": "paragraph", "chars": 309, "mode": "buffer"}, "latency_s": 2.256612486, "rtf": 0.12536561914417854}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.594532845, "rtf": 0.1265750200207499}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.60711325, "rtf": 0.126784692563781}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.67254611, "rtf": 0.12787523568651796}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.534668022, "rtf": 0.12557727712801198}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.523013265, "rtf": 0.12538303198736672}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.583849104, "rtf": 0.12639695841267326}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.691403999, "rtf": 0.1281895325269478}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.783547797, "rtf": 0.12972525609476626}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.665957843, "rtf": 0.12776543169403462}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.58255987, "rtf": 0.12637547126886972}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.496329274, "rtf": 0.12493830065708059}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.831440824, "rtf": 0.13052346988554214}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.678555052, "rtf": 0.12797538430256541}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.548786673, "rtf": 0.12581258699755418}
+{"type": "call", "cell": "tts/page/file", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "file"}, "latency_s": 7.505143338, "rtf": 0.12508520111166202}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.523113069, "rtf": 0.12538469538043592}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.495137021, "rtf": 0.12491842985654225}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.53330115, "rtf": 0.12555449602293323}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.484025227, "rtf": 0.12473323406152474}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.528489156, "rtf": 0.1254742964570981}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.539295527, "rtf": 0.12565440188999213}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.533993446, "rtf": 0.125566034241524}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.559746454, "rtf": 0.1259952492531281}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.722039306, "rtf": 0.1287001188495048}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.486339475, "rtf": 0.12477180470081375}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.488183785, "rtf": 0.12480254307273721}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.492180567, "rtf": 0.12486915582851738}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.638754209, "rtf": 0.12731203968316798}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.544711201, "rtf": 0.12574466274723856}
+{"type": "call", "cell": "tts/page/buffer", "kind": "measured", "first": false, "axes": {"length": "page", "chars": 1451, "mode": "buffer"}, "latency_s": 7.578389747, "rtf": 0.12630596950846038}
