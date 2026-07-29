@@ -100,8 +100,21 @@
               cargoCheckType = "clippy";
               cargoCheckFlags = [ "--all-targets" "--" "-D" "warnings" ];
 
-              nativeBuildInputs = [ pkgs.pkg-config pkgs.dbus ];
-              buildInputs = [ pkgs.cacert pkgs.openssl onnxruntime pkgs.stdenv.cc.cc.lib ];
+              nativeBuildInputs = [
+                pkgs.pkg-config
+                pkgs.dbus
+                pkgs.makeWrapper
+                pkgs.llvmPackages.libclang
+              ];
+              buildInputs = [
+                pkgs.cacert
+                pkgs.openssl
+                pkgs.pipewire
+                onnxruntime
+                pkgs.stdenv.cc.cc.lib
+              ];
+              BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include";
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
               ORT_LIB_LOCATION = "${onnxruntime}/lib";
               ORT_PREFER_DYNAMIC_LINK = "1";
               ORT_OFFLINE = "1";
@@ -123,8 +136,10 @@
               '';
               postFixup = ''
                 for binary in $out/bin/*; do
-                  patchelf --add-rpath ${onnxruntime}/lib:${pkgs.stdenv.cc.cc.lib}/lib "$binary"
+                  patchelf --add-rpath ${onnxruntime}/lib:${pkgs.pipewire}/lib:${pkgs.stdenv.cc.cc.lib}/lib "$binary"
                 done
+                wrapProgram $out/bin/sophon \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.espeak-ng ]}
               '';
             };
         in rec {
@@ -194,10 +209,33 @@
       });
 
       devShells = forAllSystems (system:
-        let pkgs = import nixpkgs { inherit system; };
+        let
+          pkgs = import nixpkgs { inherit system; };
+          onnxruntime = pkgs.onnxruntime.override {
+            pythonSupport = true;
+            openvinoSupport = false;
+          };
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy pkgs.pkg-config pkgs.openssl pkgs.dbus ];
+            packages = [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.clippy
+              pkgs.pkg-config
+              pkgs.openssl
+              pkgs.dbus
+              pkgs.pipewire
+              pkgs.espeak-ng
+              pkgs.llvmPackages.libclang
+              onnxruntime
+            ];
+            BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include";
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            LD_LIBRARY_PATH = "${onnxruntime}/lib";
+            ORT_LIB_LOCATION = "${onnxruntime}/lib";
+            ORT_PREFER_DYNAMIC_LINK = "1";
+            ORT_OFFLINE = "1";
           };
         });
 
@@ -283,9 +321,15 @@
             touch $out
           '';
           closure-policy = pkgs.runCommand "sophon-closure-policy" {} ''
-            ! grep -Ei '/(cuda|rocm|migraphx|hip|wayland|xorg|gtk|qt|pulseaudio|pipewire|portal|alsa)-' ${cpuClosure}/store-paths
-            ! grep -Ei '/(rocm|migraphx|amd|hip)-' ${cudaClosure}/store-paths
-            grep -Ei '/(rocm|migraphx|hip)-' ${migraphxClosure}/store-paths
+            grep -F 'name = "tts-rs"' ${self}/Cargo.lock
+            for closure in ${cpuClosure} ${cudaClosure} ${migraphxClosure}; do
+              grep -Ei -- '-pipewire-' "$closure/store-paths"
+              grep -Ei -- '-espeak-ng-' "$closure/store-paths"
+              grep -Ei -- '-onnxruntime-' "$closure/store-paths"
+            done
+            ! grep -Ei -- '-(cuda|rocm|migraphx|hip|xorg|gtk|qt|pulseaudio|portal)-' ${cpuClosure}/store-paths
+            ! grep -Ei -- '-(rocm|migraphx|amd|hip)-' ${cudaClosure}/store-paths
+            grep -Ei -- '-(rocm|migraphx|hip)-' ${migraphxClosure}/store-paths
             touch $out
           '';
           cuda-evaluates = self.packages.${system}.sophon-cuda;

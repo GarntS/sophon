@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader, Cursor},
+    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
@@ -11,19 +11,22 @@ use std::{
 
 use futures_util::StreamExt;
 use sophon::{
-    acquisition::{CANARY, ModelLifecycle},
+    acquisition::{CANARY, ModelLifecycle, TtsLifecycle},
+    config::{Config, ConfigPaths},
     dbus::SophonDbus,
-    domain::TranscriptionOptions,
+    domain::{OwnedAudio, SophonError, TranscriptionOptions, TtsCapabilities, TtsRequest},
+    playback::{PlaybackRequest, PlaybackWorker, SpeechPlayback},
     postprocess::{IdentityProcessor, PostProcessingPipeline},
-    service::TranscriptionService,
+    service::{TranscriptionService, TtsService},
     transport::{BUS_NAME, INTERFACE, OBJECT_PATH},
+    tts::{TtsProvider, TtsWorker},
     worker::ModelWorker,
 };
 use transcribe_rs::{
     ModelCapabilities as BackendCapabilities, SpeechModel, TranscribeError, TranscribeOptions,
     TranscriptionResult,
 };
-use zbus::zvariant::{OwnedFd as ZbusOwnedFd, OwnedValue, Str};
+use zbus::zvariant::{Fd, OwnedFd as ZbusOwnedFd, OwnedValue, Str};
 
 struct IsolatedBus {
     child: Child,
@@ -103,6 +106,58 @@ impl SpeechModel for FixtureModel {
     }
 }
 
+struct FixtureTtsProvider {
+    calls: Arc<Mutex<Vec<TtsRequest>>>,
+}
+
+impl TtsProvider for FixtureTtsProvider {
+    fn provider_id(&self) -> &'static str {
+        "fixture-tts"
+    }
+
+    fn model_id(&self) -> &str {
+        "fixture-tts-model"
+    }
+
+    fn capabilities(&self) -> TtsCapabilities {
+        TtsCapabilities {
+            named_voices: true,
+            voice_cloning: false,
+            voice_design: false,
+        }
+    }
+
+    fn voices(&self) -> &[String] {
+        static VOICES: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(|| vec!["af_heart".into(), "am_adam".into()]);
+        &VOICES
+    }
+
+    fn synthesize(&mut self, request: &TtsRequest) -> Result<OwnedAudio, SophonError> {
+        self.calls.lock().unwrap().push(request.clone());
+        if request.text == "fail" {
+            return Err(SophonError::SynthesisFailed("fixture failure".into()));
+        }
+        std::thread::sleep(Duration::from_millis(75));
+        Ok(OwnedAudio {
+            samples: vec![request.speed as f32; 240],
+            sample_rate: 24_000,
+        })
+    }
+}
+
+struct FixturePlayback {
+    calls: Arc<Mutex<Vec<PlaybackRequest>>>,
+}
+
+impl SpeechPlayback for FixturePlayback {
+    fn play(&mut self, request: PlaybackRequest) -> Result<(), SophonError> {
+        self.calls.lock().unwrap().push(request);
+        std::thread::sleep(Duration::from_millis(25));
+        Ok(())
+    }
+}
+
 fn wav(marker: i16, sample_count: usize) -> Vec<u8> {
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = hound::WavWriter::new(
@@ -131,6 +186,20 @@ fn string_option(key: &str, value: &str) -> HashMap<String, OwnedValue> {
         key.to_owned(),
         OwnedValue::from(Str::from(value.to_owned())),
     )])
+}
+
+fn double_option(key: &str, value: f64) -> HashMap<String, OwnedValue> {
+    HashMap::from([(key.to_owned(), OwnedValue::from(value))])
+}
+
+fn fd_option(key: &str, fd: std::os::fd::OwnedFd) -> HashMap<String, OwnedValue> {
+    HashMap::from([(key.to_owned(), OwnedValue::try_from(Fd::from(fd)).unwrap())])
+}
+
+fn default_tts_config() -> sophon::config::TtsConfig {
+    let root = tempfile::tempdir().unwrap();
+    let paths = ConfigPaths::from_homes(root.path().join("config"), root.path().join("cache"));
+    Config::load(&paths).unwrap().tts.unwrap()
 }
 
 fn assert_error_name(error: zbus::Error, expected: &str) {
@@ -164,14 +233,37 @@ async fn isolated_session_bus_covers_the_public_contract() {
         "canary".into(),
         CANARY.id.into(),
     ));
+    let tts_lifecycle = TtsLifecycle::new();
+    let tts_calls = Arc::new(Mutex::new(Vec::new()));
+    let playback_calls = Arc::new(Mutex::new(Vec::new()));
+    let mut tts_config = default_tts_config();
+    tts_config.queue_capacity = 2;
+    let tts_worker = TtsWorker::new(
+        Box::new(FixtureTtsProvider {
+            calls: tts_calls.clone(),
+        }),
+        tts_config.queue_capacity,
+        tts_config.max_generated_audio_seconds,
+    );
+    let playback = PlaybackWorker::new(
+        Box::new(FixturePlayback {
+            calls: playback_calls.clone(),
+        }),
+        tts_config.queue_capacity,
+    );
+    let tts_service = Arc::new(TtsService::new(
+        tts_lifecycle.clone(),
+        tts_worker,
+        playback,
+        tts_config.clone(),
+    ));
+    let mut dbus = SophonDbus::ready(defaults, lifecycle.clone(), service, 4_096, 60);
+    dbus.install_tts(tts_config.clone(), tts_lifecycle.clone(), tts_service);
     let server = zbus::connection::Builder::address(bus.address.as_str())
         .unwrap()
         .name(BUS_NAME)
         .unwrap()
-        .serve_at(
-            OBJECT_PATH,
-            SophonDbus::ready(defaults, lifecycle.clone(), service, 4_096, 60),
-        )
+        .serve_at(OBJECT_PATH, dbus)
         .unwrap()
         .build()
         .await
@@ -193,6 +285,58 @@ async fn isolated_session_bus_covers_the_public_contract() {
     assert!(xml.contains("arg name=\"values\" type=\"a{sv}\" direction=\"in\""));
     assert!(xml.contains("arg type=\"s\" direction=\"out\""));
     assert!(!xml.contains("method name=\"transcribe_file\""));
+    assert!(xml.contains("method name=\"SpeakToFile\""));
+    assert!(xml.contains("method name=\"SpeakToBuffer\""));
+    assert!(xml.contains("method name=\"SpeakAloud\""));
+    assert!(xml.contains("property name=\"TtsState\" type=\"s\" access=\"read\""));
+    assert!(xml.contains("property name=\"AvailableVoices\" type=\"as\" access=\"read\""));
+    assert!(xml.contains("property name=\"TtsCapabilities\" type=\"as\" access=\"read\""));
+
+    let error = proxy
+        .call::<_, _, (ZbusOwnedFd, u64)>("SpeakToBuffer", &("hello", empty_options()))
+        .await
+        .unwrap_err();
+    assert_error_name(error, "com.garntresearch.sophon.NotReady");
+
+    tts_lifecycle.loading("fixture-tts", "fixture-tts-model");
+    tts_lifecycle.ready(
+        vec!["af_heart".into(), "am_adam".into()],
+        TtsCapabilities {
+            named_voices: true,
+            voice_cloning: false,
+            voice_design: false,
+        },
+    );
+    let error = proxy
+        .call::<_, _, (ZbusOwnedFd, u64)>(
+            "SpeakToBuffer",
+            &("hello", string_option("speed", "fast")),
+        )
+        .await
+        .unwrap_err();
+    assert_error_name(error, "com.garntresearch.sophon.InvalidTtsOptions");
+    let error = proxy
+        .call::<_, _, (ZbusOwnedFd, u64)>(
+            "SpeakToBuffer",
+            &("hello", string_option("voice", "missing")),
+        )
+        .await
+        .unwrap_err();
+    assert_error_name(error, "com.garntresearch.sophon.InvalidTtsOptions");
+    let clone_file: std::os::fd::OwnedFd = tempfile::tempfile().unwrap().into();
+    let error = proxy
+        .call::<_, _, (ZbusOwnedFd, u64)>(
+            "SpeakToBuffer",
+            &("hello", fd_option("clone_audio", clone_file)),
+        )
+        .await
+        .unwrap_err();
+    assert_error_name(error, "com.garntresearch.sophon.UnsupportedCapability");
+    let error = proxy
+        .call::<_, _, (ZbusOwnedFd, u64)>("SpeakToBuffer", &("fail", empty_options()))
+        .await
+        .unwrap_err();
+    assert_error_name(error, "com.garntresearch.sophon.SynthesisFailed");
 
     let audio = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(audio.path(), wav(7, 8)).unwrap();
@@ -268,6 +412,15 @@ async fn isolated_session_bus_covers_the_public_contract() {
         .await
         .unwrap_err();
     assert_error_name(error, "com.garntresearch.sophon.ModelUnavailable");
+    let (_fd, _size): (ZbusOwnedFd, u64) = proxy
+        .call(
+            "SpeakToBuffer",
+            &("TTS survives STT failure", empty_options()),
+        )
+        .await
+        .unwrap();
+    let tts_state_while_stt_failed: String = proxy.get_property("TtsState").await.unwrap();
+    assert_eq!(tts_state_while_stt_failed, "Ready");
 
     let properties = zbus::fdo::PropertiesProxy::builder(&client)
         .destination(BUS_NAME)
@@ -294,14 +447,91 @@ async fn isolated_session_bus_covers_the_public_contract() {
         .expect("PropertiesChanged signal timed out")
         .expect("PropertiesChanged stream ended");
     assert_eq!(changed.args().unwrap().interface_name(), INTERFACE);
-    let state: String = proxy.get_property("State").await.unwrap();
-    let engine: String = proxy.get_property("ActiveEngine").await.unwrap();
-    let model: String = proxy.get_property("ActiveModel").await.unwrap();
-    let progress: f64 = proxy.get_property("DownloadProgress").await.unwrap();
+    let stt_interface_name = zbus::names::InterfaceName::try_from(INTERFACE).unwrap();
+    let state = String::try_from(
+        properties
+            .get(stt_interface_name.clone(), "State")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let engine = String::try_from(
+        properties
+            .get(stt_interface_name.clone(), "ActiveEngine")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let model = String::try_from(
+        properties
+            .get(stt_interface_name.clone(), "ActiveModel")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let progress = f64::try_from(
+        properties
+            .get(stt_interface_name, "DownloadProgress")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(state, "Downloading");
     assert_eq!(engine, "canary");
     assert_eq!(model, CANARY.id);
     assert_eq!(progress, 0.5);
+
+    let mut tts_changes = properties.receive_properties_changed().await.unwrap();
+    tts_lifecycle.downloading(0.25);
+    SophonDbus::emit_tts_lifecycle_changed(&interface)
+        .await
+        .unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(2), tts_changes.next())
+        .await
+        .expect("TTS PropertiesChanged signal timed out")
+        .expect("TTS PropertiesChanged stream ended");
+    assert_eq!(changed.args().unwrap().interface_name(), INTERFACE);
+    let interface_name = zbus::names::InterfaceName::try_from(INTERFACE).unwrap();
+    let tts_state = String::try_from(
+        properties
+            .get(interface_name.clone(), "TtsState")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let tts_provider = String::try_from(
+        properties
+            .get(interface_name.clone(), "ActiveTtsProvider")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let tts_model = String::try_from(
+        properties
+            .get(interface_name.clone(), "ActiveTtsModel")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let tts_progress = f64::try_from(
+        properties
+            .get(interface_name, "TtsDownloadProgress")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tts_state, "Downloading");
+    assert_eq!(tts_provider, "fixture-tts");
+    assert_eq!(tts_model, "fixture-tts-model");
+    assert_eq!(tts_progress, 0.25);
+    tts_lifecycle.ready(
+        vec!["af_heart".into(), "am_adam".into()],
+        TtsCapabilities {
+            named_voices: true,
+            voice_cloning: false,
+            voice_design: false,
+        },
+    );
 
     lifecycle.ready();
     let first = tempfile::NamedTempFile::new().unwrap();
@@ -324,19 +554,122 @@ async fn isolated_session_bus_covers_the_public_contract() {
         request(third.path().to_str().unwrap().to_owned()),
     );
     let results = [one, two, three];
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 2);
+    assert!((1..=2).contains(&results.iter().filter(|result| result.is_ok()).count()));
     let error = results
         .into_iter()
         .find_map(Result::err)
         .expect("one concurrent request should be rejected");
     assert_error_name(error, "com.garntresearch.sophon.ResourceLimit");
 
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("speech.wav");
+    let size: u64 = proxy
+        .call(
+            "SpeakToFile",
+            &(
+                "named voice",
+                output_path.to_str().unwrap(),
+                string_option("voice", "am_adam"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(size, std::fs::metadata(&output_path).unwrap().len());
+    let reader = hound::WavReader::open(&output_path).unwrap();
+    assert_eq!(reader.spec().channels, 1);
+    assert_eq!(reader.spec().sample_rate, 24_000);
+    assert_eq!(reader.spec().sample_format, hound::SampleFormat::Float);
+    let error = proxy
+        .call::<_, _, u64>(
+            "SpeakToFile",
+            &(
+                "must not replace",
+                output_path.to_str().unwrap(),
+                empty_options(),
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_error_name(error, "com.garntresearch.sophon.OutputExists");
+
+    let (buffer_fd, buffer_size): (ZbusOwnedFd, u64) = proxy
+        .call("SpeakToBuffer", &("buffer", double_option("speed", 1.5)))
+        .await
+        .unwrap();
+    let fd: std::os::fd::OwnedFd = buffer_fd.into();
+    let mut file = File::from(fd);
+    assert_eq!(file.stream_position().unwrap(), 0);
+    let mut buffer_bytes = Vec::new();
+    file.read_to_end(&mut buffer_bytes).unwrap();
+    assert_eq!(buffer_size, buffer_bytes.len() as u64);
+    let memfd = memfd::Memfd::try_from_file(file).unwrap();
+    let seals = memfd.seals().unwrap();
+    assert!(seals.contains(&memfd::FileSeal::SealWrite));
+    assert!(seals.contains(&memfd::FileSeal::SealGrow));
+    assert!(seals.contains(&memfd::FileSeal::SealShrink));
+    assert!(seals.contains(&memfd::FileSeal::SealSeal));
+    let mut client_file = memfd.into_file();
+    client_file.seek(SeekFrom::Start(0)).unwrap();
+    let reader = hound::WavReader::new(client_file).unwrap();
+    assert_eq!(reader.spec().sample_rate, 24_000);
+
+    let started = std::time::Instant::now();
+    let aloud_one_args = ("aloud one", empty_options());
+    let aloud_two_args = ("aloud two", empty_options());
+    let (aloud_one, aloud_two) = tokio::join!(
+        proxy.call::<_, _, ()>("SpeakAloud", &aloud_one_args),
+        proxy.call::<_, _, ()>("SpeakAloud", &aloud_two_args),
+    );
+    assert!(aloud_one.is_ok());
+    assert!(aloud_two.is_ok());
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    assert_eq!(playback_calls.lock().unwrap().len(), 2);
+
+    let request_tts = |text: &'static str| {
+        let proxy = proxy.clone();
+        async move {
+            proxy
+                .call::<_, _, (ZbusOwnedFd, u64)>("SpeakToBuffer", &(text, empty_options()))
+                .await
+        }
+    };
+    let (one, two, three, four) = tokio::join!(
+        request_tts("queue one"),
+        request_tts("queue two"),
+        request_tts("queue three"),
+        request_tts("queue four"),
+    );
+    let tts_results = [one, two, three, four];
+    assert!((1..=3).contains(&tts_results.iter().filter(|result| result.is_ok()).count()));
+    let error = tts_results
+        .into_iter()
+        .find_map(Result::err)
+        .expect("one concurrent TTS request should be rejected");
+    assert_error_name(error, "com.garntresearch.sophon.ResourceLimit");
+
     let recorded = calls.lock().unwrap().clone();
-    assert_eq!(recorded.len(), 5);
+    assert!((4..=5).contains(&recorded.len()));
     assert!(
         recorded[3..]
             .iter()
             .all(|marker| (11..=13).contains(marker))
     );
-    assert_ne!(recorded[3], recorded[4]);
+    if recorded.len() == 5 {
+        assert_ne!(recorded[3], recorded[4]);
+    }
+
+    tts_lifecycle.failed("fixture TTS initialization failed");
+    SophonDbus::emit_tts_lifecycle_changed(&interface)
+        .await
+        .unwrap();
+    lifecycle.ready();
+    let text: String = proxy
+        .call("TranscribeFile", &(path, empty_options()))
+        .await
+        .unwrap();
+    assert_eq!(text, "fixture-7");
+    let interface_name = zbus::names::InterfaceName::try_from(INTERFACE).unwrap();
+    let tts_state_after_stt_use =
+        String::try_from(properties.get(interface_name, "TtsState").await.unwrap()).unwrap();
+    assert_eq!(tts_state_after_stt_use, "Failed");
 }

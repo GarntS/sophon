@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::{Engine, Quantization},
-    domain::SophonError,
+    domain::{SophonError, TtsCapabilities, TtsState},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +71,78 @@ impl Default for ModelLifecycle {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TtsLifecycleSnapshot {
+    pub state: TtsState,
+    pub active_provider: Option<String>,
+    pub active_model: Option<String>,
+    pub download_progress: f32,
+    pub last_error: Option<String>,
+    pub available_voices: Vec<String>,
+    pub capabilities: TtsCapabilities,
+}
+
+#[derive(Clone, Debug)]
+pub struct TtsLifecycle(Arc<RwLock<TtsLifecycleSnapshot>>);
+
+impl TtsLifecycle {
+    pub fn new() -> Self {
+        Self(Arc::new(RwLock::new(TtsLifecycleSnapshot {
+            state: TtsState::Initializing,
+            active_provider: None,
+            active_model: None,
+            download_progress: 0.0,
+            last_error: None,
+            available_voices: Vec::new(),
+            capabilities: TtsCapabilities {
+                named_voices: false,
+                voice_cloning: false,
+                voice_design: false,
+            },
+        })))
+    }
+
+    pub fn snapshot(&self) -> TtsLifecycleSnapshot {
+        self.0.read().expect("TTS lifecycle lock poisoned").clone()
+    }
+
+    pub fn downloading(&self, progress: f32) {
+        let mut snapshot = self.0.write().expect("TTS lifecycle lock poisoned");
+        snapshot.state = TtsState::Downloading { progress };
+        snapshot.download_progress = progress.clamp(0.0, 1.0);
+    }
+
+    pub fn loading(&self, provider: impl Into<String>, model: impl Into<String>) {
+        let mut snapshot = self.0.write().expect("TTS lifecycle lock poisoned");
+        snapshot.state = TtsState::Loading;
+        snapshot.active_provider = Some(provider.into());
+        snapshot.active_model = Some(model.into());
+    }
+
+    pub fn ready(&self, voices: Vec<String>, capabilities: TtsCapabilities) {
+        let mut snapshot = self.0.write().expect("TTS lifecycle lock poisoned");
+        snapshot.state = TtsState::Ready;
+        snapshot.available_voices = voices;
+        snapshot.capabilities = capabilities;
+        snapshot.last_error = None;
+    }
+
+    pub fn failed(&self, error: impl Into<String>) {
+        let mut snapshot = self.0.write().expect("TTS lifecycle lock poisoned");
+        let error = error.into();
+        snapshot.state = TtsState::Failed {
+            message: error.clone(),
+        };
+        snapshot.last_error = Some(error);
+    }
+}
+
+impl Default for TtsLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelFile {
     pub relative_path: &'static str,
@@ -92,6 +164,76 @@ pub struct ModelDefinition {
     pub quantization: Quantization,
     pub files: &'static [ModelFile],
     pub capabilities: ModelCapabilities,
+}
+
+/// Provider-neutral manifest used by both STT and TTS acquisition registries.
+pub trait ArtifactManifest: Sync {
+    fn id(&self) -> &'static str;
+    fn revision(&self) -> &'static str;
+    fn files(&self) -> &'static [ModelFile];
+}
+
+impl ArtifactManifest for ModelDefinition {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn revision(&self) -> &'static str {
+        self.revision
+    }
+
+    fn files(&self) -> &'static [ModelFile] {
+        self.files
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtsModelDefinition {
+    pub id: &'static str,
+    pub provider: &'static str,
+    pub revision: &'static str,
+    pub files: &'static [ModelFile],
+}
+
+impl ArtifactManifest for TtsModelDefinition {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn revision(&self) -> &'static str {
+        self.revision
+    }
+
+    fn files(&self) -> &'static [ModelFile] {
+        self.files
+    }
+}
+
+const KOKORO_FILES: &[ModelFile] = &[
+    ModelFile {
+        relative_path: "kokoro-v1.0.int8.onnx",
+        url: "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx",
+        sha256: "6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb",
+    },
+    ModelFile {
+        relative_path: "voices-v1.0.bin",
+        url: "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
+        sha256: "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d",
+    },
+];
+
+pub const KOKORO: TtsModelDefinition = TtsModelDefinition {
+    id: "kokoro-v1.0-int8",
+    provider: "tts-rs",
+    revision: "model-files-v1.0",
+    files: KOKORO_FILES,
+};
+
+pub fn lookup_tts(id: &str) -> Option<&'static TtsModelDefinition> {
+    match id {
+        "kokoro-v1.0-int8" => Some(&KOKORO),
+        _ => None,
+    }
 }
 
 const PARAKEET_FILES: &[ModelFile] = &[
@@ -171,8 +313,11 @@ pub fn lookup(id: &str) -> Option<&'static ModelDefinition> {
     }
 }
 
-pub fn validate_layout(root: &Path, model: &ModelDefinition) -> Result<(), SophonError> {
-    for file in model.files {
+pub fn validate_layout<M: ArtifactManifest + ?Sized>(
+    root: &Path,
+    model: &M,
+) -> Result<(), SophonError> {
+    for file in model.files() {
         let path = root.join(file.relative_path);
         if !path.is_file() {
             return Err(SophonError::ModelUnavailable(format!(
@@ -184,49 +329,68 @@ pub fn validate_layout(root: &Path, model: &ModelDefinition) -> Result<(), Sopho
     Ok(())
 }
 
-pub fn cache_path(cache_root: &Path, model: &ModelDefinition) -> PathBuf {
-    cache_root.join(model.id).join(model.revision)
+pub fn cache_path<M: ArtifactManifest + ?Sized>(cache_root: &Path, model: &M) -> PathBuf {
+    cache_root.join(model.id()).join(model.revision())
 }
 
-/// Returns a cache entry only after its complete manifest and expected layout
-/// have been verified. Invalid or partial entries are never usable offline.
-pub fn validated_cache(cache_root: &Path, model: &'static ModelDefinition) -> Option<PathBuf> {
-    let root = cache_path(cache_root, model);
-    for file in model.files {
-        let mut input = File::open(root.join(file.relative_path)).ok()?;
+pub fn validate_manifest<M: ArtifactManifest + ?Sized>(
+    root: &Path,
+    model: &M,
+) -> Result<(), SophonError> {
+    validate_layout(root, model)?;
+    for file in model.files() {
+        let path = root.join(file.relative_path);
+        let mut input =
+            File::open(&path).map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
         let mut hasher = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let read = input.read(&mut buffer).ok()?;
+            let read = input
+                .read(&mut buffer)
+                .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
             if read == 0 {
                 break;
             }
             hasher.update(&buffer[..read]);
         }
         if format!("{:x}", hasher.finalize()) != file.sha256 {
-            return None;
+            return Err(SophonError::ModelUnavailable(format!(
+                "SHA-256 mismatch for {}",
+                path.display()
+            )));
         }
     }
-    validate_layout(&root, model).ok()?;
+    Ok(())
+}
+
+/// Returns a cache entry only after its complete manifest and expected layout
+/// have been verified. Invalid or partial entries are never usable offline.
+pub fn validated_cache<M: ArtifactManifest + ?Sized>(
+    cache_root: &Path,
+    model: &'static M,
+) -> Option<PathBuf> {
+    let root = cache_path(cache_root, model);
+    validate_manifest(&root, model).ok()?;
     Some(root)
 }
 
 /// Acquires every manifest file into a temporary directory, verifies it, and
 /// atomically publishes the complete model directory. `reqwest` honors the
 /// standard proxy environment variables by default.
-pub async fn acquire<F>(
+pub async fn acquire<M, F>(
     cache_root: &Path,
-    model: &'static ModelDefinition,
+    model: &'static M,
     mut progress: F,
 ) -> Result<PathBuf, SophonError>
 where
+    M: ArtifactManifest + ?Sized,
     F: FnMut(f32),
 {
     if let Some(path) = validated_cache(cache_root, model) {
         return Ok(path);
     }
     fs::create_dir_all(cache_root).map_err(|e| SophonError::ModelUnavailable(e.to_string()))?;
-    let lock_path = cache_root.join(format!(".{}.lock", model.id));
+    let lock_path = cache_root.join(format!(".{}.lock", model.id()));
     // Advisory locking can block while another daemon downloads. Keep that wait
     // off the async executor so concurrent acquisitions do not deadlock it.
     let _lock = tokio::task::spawn_blocking(move || -> Result<File, SophonError> {
@@ -247,8 +411,8 @@ where
         .tempdir_in(cache_root)
         .map_err(|e| SophonError::ModelUnavailable(e.to_string()))?;
     let client = reqwest::Client::new();
-    let total = model.files.len() as f32;
-    for (index, file) in model.files.iter().enumerate() {
+    let total = model.files().len() as f32;
+    for (index, file) in model.files().iter().enumerate() {
         let response = client
             .get(file.url)
             .send()
@@ -318,9 +482,56 @@ pub fn resolve_location(
         .ok_or_else(|| SophonError::ModelUnavailable(format!("unknown model `{model_id}`")))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TtsModelLocation {
+    LocalOverride(PathBuf),
+    Registry(&'static TtsModelDefinition),
+}
+
+/// Resolves TTS overrides independently. A present invalid override is terminal
+/// and can never trigger an automatic registry download.
+pub fn resolve_tts_location(
+    model_id: &str,
+    override_path: Option<&Path>,
+) -> Result<TtsModelLocation, SophonError> {
+    if let Some(path) = override_path {
+        let model = lookup_tts(model_id).ok_or_else(|| {
+            SophonError::ModelUnavailable(format!("unknown TTS model `{model_id}`"))
+        })?;
+        validate_manifest(path, model)?;
+        return Ok(TtsModelLocation::LocalOverride(path.to_path_buf()));
+    }
+    lookup_tts(model_id)
+        .map(TtsModelLocation::Registry)
+        .ok_or_else(|| SophonError::ModelUnavailable(format!("unknown TTS model `{model_id}`")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tts_registry_pins_exact_kokoro_release_layout_and_digests() {
+        assert_eq!(KOKORO.provider, "tts-rs");
+        assert_eq!(KOKORO.revision, "model-files-v1.0");
+        assert_eq!(
+            KOKORO
+                .files
+                .iter()
+                .map(|file| file.relative_path)
+                .collect::<Vec<_>>(),
+            ["kokoro-v1.0.int8.onnx", "voices-v1.0.bin"]
+        );
+        assert!(KOKORO.files.iter().all(|file| {
+            file.url.starts_with(
+                "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/",
+            ) && file.sha256.len() == 64
+                && file
+                    .sha256
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        }));
+    }
 
     #[test]
     fn registry_has_pinned_https_files_for_both_engines() {
@@ -345,6 +556,23 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tts_override_is_terminal_and_never_falls_back_to_download() {
+        let path = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            resolve_tts_location(KOKORO.id, Some(path.path())),
+            Err(SophonError::ModelUnavailable(_))
+        ));
+
+        for file in KOKORO.files {
+            std::fs::write(path.path().join(file.relative_path), b"wrong digest").unwrap();
+        }
+        assert!(matches!(
+            resolve_tts_location(KOKORO.id, Some(path.path())),
+            Err(SophonError::ModelUnavailable(message)) if message.contains("SHA-256")
+        ));
+    }
+
+    #[test]
     fn partial_cache_is_not_usable() {
         let cache = tempfile::tempdir().unwrap();
         let root = cache_path(cache.path(), &PARAKEET);
@@ -353,33 +581,18 @@ mod tests {
         assert_eq!(validated_cache(cache.path(), &PARAKEET), None);
     }
 
-    fn fixture_model(url: String, bytes: &[u8]) -> &'static ModelDefinition {
+    fn fixture_tts_model(url: String, bytes: &[u8]) -> &'static TtsModelDefinition {
         let file = ModelFile {
             relative_path: "model.onnx",
             url: Box::leak(url.into_boxed_str()),
             sha256: Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str()),
         };
-        ModelDefinition {
-            id: "fixture-model",
-            engine: Engine::Parakeet,
+        Box::leak(Box::new(TtsModelDefinition {
+            id: "fixture-tts-model",
+            provider: "fixture",
             revision: "fixture",
-            quantization: Quantization::Int8,
             files: Box::leak(vec![file].into_boxed_slice()),
-            capabilities: ModelCapabilities {
-                languages: &["en"],
-                translation_to_english: false,
-            },
-        }
-        .leak()
-    }
-
-    trait Leak {
-        fn leak(self) -> &'static ModelDefinition;
-    }
-    impl Leak for ModelDefinition {
-        fn leak(self) -> &'static ModelDefinition {
-            Box::leak(Box::new(self))
-        }
+        }))
     }
 
     fn fixture_server(body: Vec<u8>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -437,7 +650,7 @@ mod tests {
     async fn download_is_verified_published_and_reused_offline() {
         let bytes = b"verified fixture";
         let (url, requests) = fixture_server(bytes.to_vec());
-        let model = fixture_model(url, bytes);
+        let model = fixture_tts_model(url, bytes);
         let cache = tempfile::tempdir().unwrap();
         let path = acquire(cache.path(), model, |_| {}).await.unwrap();
         assert_eq!(std::fs::read(path.join("model.onnx")).unwrap(), bytes);
@@ -466,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn digest_mismatch_never_publishes_a_cache_entry() {
         let (url, _) = fixture_server(b"wrong bytes".to_vec());
-        let model = fixture_model(url, b"expected bytes");
+        let model = fixture_tts_model(url, b"expected bytes");
         let cache = tempfile::tempdir().unwrap();
         assert!(matches!(
             acquire(cache.path(), model, |_| {}).await,
@@ -478,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn interrupted_download_leaves_no_cache_and_a_later_attempt_recovers() {
         let bytes = b"complete fixture";
-        let model = fixture_model(interrupted_fixture_server(), bytes);
+        let model = fixture_tts_model(interrupted_fixture_server(), bytes);
         let cache = tempfile::tempdir().unwrap();
         assert!(matches!(
             acquire(cache.path(), model, |_| {}).await,
@@ -487,7 +700,7 @@ mod tests {
         assert!(!cache_path(cache.path(), model).exists());
 
         let (url, _) = fixture_server(bytes.to_vec());
-        let recovered = fixture_model(url, bytes);
+        let recovered = fixture_tts_model(url, bytes);
         assert!(acquire(cache.path(), recovered, |_| {}).await.is_ok());
     }
 
@@ -495,7 +708,7 @@ mod tests {
     async fn concurrent_acquisition_publishes_one_verified_cache_entry() {
         let bytes = b"concurrent fixture";
         let (url, requests) = fixture_server(bytes.to_vec());
-        let model = fixture_model(url, bytes);
+        let model = fixture_tts_model(url, bytes);
         let cache = tempfile::tempdir().unwrap();
         let (first, second) = tokio::join!(
             acquire(cache.path(), model, |_| {}),

@@ -3,14 +3,16 @@
 use std::sync::Arc;
 
 use crate::{
-    acquisition::{self, ModelLifecycle, ModelLocation},
+    acquisition::{self, ModelLifecycle, ModelLocation, TtsLifecycle, TtsModelLocation},
     backend,
-    config::{Config, ConfigPaths, DEFAULT_MAX_AUDIO_BYTES, DEFAULT_MAX_AUDIO_SECONDS},
+    config::{Config, ConfigPaths, DEFAULT_MAX_AUDIO_BYTES, DEFAULT_MAX_AUDIO_SECONDS, TtsConfig},
     dbus::SophonDbus,
-    domain::{SophonError, TranscriptionOptions},
+    domain::{SophonError, TranscriptionOptions, TtsCapabilities},
+    playback::{PipeWirePlayback, PlaybackWorker},
     postprocess::{IdentityProcessor, PostProcessingPipeline},
-    service::TranscriptionService,
+    service::{TranscriptionService, TtsService},
     transport::{BUS_NAME, OBJECT_PATH},
+    tts::{KokoroProvider, TtsProvider, TtsWorker},
     worker::ModelWorker,
 };
 
@@ -70,6 +72,59 @@ async fn initialize(
     Ok((Arc::new(service), defaults))
 }
 
+async fn initialize_tts(
+    config: TtsConfig,
+    lifecycle: TtsLifecycle,
+) -> Result<(Arc<TtsService>, Vec<String>, TtsCapabilities), SophonError> {
+    let model_dir =
+        match acquisition::resolve_tts_location(&config.model_id, config.model_path.as_deref())? {
+            TtsModelLocation::LocalOverride(path) => path,
+            TtsModelLocation::Registry(model) => {
+                if let Some(path) = acquisition::validated_cache(&config.cache_dir, model) {
+                    path
+                } else if config.automatic_download {
+                    let progress = lifecycle.clone();
+                    lifecycle.downloading(0.0);
+                    acquisition::acquire(&config.cache_dir, model, move |value| {
+                        progress.downloading(value)
+                    })
+                    .await?
+                } else {
+                    return Err(SophonError::ModelUnavailable(
+                        "TTS model is not cached and automatic downloads are disabled".into(),
+                    ));
+                }
+            }
+        };
+    lifecycle.loading(config.provider.clone(), config.model_id.clone());
+    let optimized_dir = config.cache_dir.join("optimized");
+    std::fs::create_dir_all(&optimized_dir)
+        .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
+    let model_id = config.model_id.clone();
+    let default_voice = config.default_voice.clone();
+    let provider = tokio::task::spawn_blocking(move || {
+        KokoroProvider::load(
+            &model_dir,
+            model_id,
+            default_voice,
+            Some(optimized_dir.join("kokoro-v1.0-int8.optimized.onnx")),
+        )
+    })
+    .await
+    .map_err(|error| SophonError::ModelUnavailable(format!("TTS load task failed: {error}")))??;
+    let voices = provider.voices().to_vec();
+    let capabilities = provider.capabilities();
+    let worker = TtsWorker::new(
+        Box::new(provider),
+        config.queue_capacity,
+        config.max_generated_audio_seconds,
+    );
+    let playback =
+        PlaybackWorker::new(Box::new(PipeWirePlayback::default()), config.queue_capacity);
+    let service = Arc::new(TtsService::new(lifecycle, worker, playback, config));
+    Ok((service, voices, capabilities))
+}
+
 async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
     let lifecycle = ModelLifecycle::new();
     // Claim the name with safe defaults; configuration and model work follows in
@@ -94,26 +149,73 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         .object_server()
         .interface::<_, SophonDbus>(OBJECT_PATH)
         .await?;
-    let init_interface = interface.clone();
-    let init_lifecycle = lifecycle.clone();
+    let tts_lifecycle = TtsLifecycle::new();
+    interface
+        .get_mut()
+        .await
+        .set_tts_lifecycle(tts_lifecycle.clone());
+
+    let config_interface = interface.clone();
+    let config_stt_lifecycle = lifecycle.clone();
+    let config_tts_lifecycle = tts_lifecycle.clone();
     tokio::spawn(async move {
-        let result = async {
-            let paths = ConfigPaths::discover()
-                .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
-            let config = Config::load(&paths)
-                .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
-            let max_audio_bytes = config.max_audio_bytes;
-            let max_audio_seconds = config.max_audio_seconds;
-            let (service, defaults) = initialize(config, init_lifecycle.clone()).await?;
-            let mut iface = init_interface.get_mut().await;
-            iface.install(defaults, service, max_audio_bytes, max_audio_seconds);
-            Ok::<(), SophonError>(())
-        }
-        .await;
-        if let Err(error) = result {
-            init_lifecycle.failed(error.to_string());
+        let config = ConfigPaths::discover()
+            .map_err(|error| SophonError::ModelUnavailable(error.to_string()))
+            .and_then(|paths| {
+                Config::load(&paths)
+                    .map_err(|error| SophonError::ModelUnavailable(error.to_string()))
+            });
+        let config = match config {
+            Ok(config) => config,
+            Err(error) => {
+                config_stt_lifecycle.failed(error.to_string());
+                config_tts_lifecycle.failed(error.to_string());
+                return;
+            }
+        };
+
+        let stt_config = config.clone();
+        let stt_interface = config_interface.clone();
+        let stt_lifecycle = config_stt_lifecycle.clone();
+        tokio::spawn(async move {
+            let max_audio_bytes = stt_config.max_audio_bytes;
+            let max_audio_seconds = stt_config.max_audio_seconds;
+            match initialize(stt_config, stt_lifecycle.clone()).await {
+                Ok((service, defaults)) => {
+                    stt_interface.get_mut().await.install(
+                        defaults,
+                        service,
+                        max_audio_bytes,
+                        max_audio_seconds,
+                    );
+                }
+                Err(error) => stt_lifecycle.failed(error.to_string()),
+            }
+        });
+
+        match config.tts {
+            Err(error) => config_tts_lifecycle.failed(error),
+            Ok(tts_config) => {
+                let tts_interface = config_interface;
+                let tts_lifecycle = config_tts_lifecycle;
+                tokio::spawn(async move {
+                    match initialize_tts(tts_config.clone(), tts_lifecycle.clone()).await {
+                        Ok((service, voices, capabilities)) => {
+                            tts_interface.get_mut().await.install_tts(
+                                tts_config,
+                                tts_lifecycle.clone(),
+                                service,
+                            );
+                            tts_lifecycle.ready(voices, capabilities);
+                        }
+                        Err(error) => tts_lifecycle.failed(error.to_string()),
+                    }
+                });
+            }
         }
     });
+
+    let stt_observer_interface = interface.clone();
     tokio::spawn(async move {
         let mut previous = lifecycle.snapshot();
         loop {
@@ -123,7 +225,20 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             previous = current;
-            let _ = SophonDbus::emit_lifecycle_changed(&interface).await;
+            let _ = SophonDbus::emit_lifecycle_changed(&stt_observer_interface).await;
+        }
+    });
+    let tts_observer_interface = interface;
+    tokio::spawn(async move {
+        let mut previous = tts_lifecycle.snapshot();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let current = tts_lifecycle.snapshot();
+            if current == previous {
+                continue;
+            }
+            previous = current;
+            let _ = SophonDbus::emit_tts_lifecycle_changed(&tts_observer_interface).await;
         }
     });
     tokio::signal::ctrl_c().await?;

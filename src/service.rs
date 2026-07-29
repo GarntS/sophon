@@ -1,12 +1,16 @@
 //! Transport-independent transcription application service.
 
-use std::sync::Arc;
+use std::{os::fd::OwnedFd, path::Path, sync::Arc};
 
 use crate::{
-    acquisition::ModelLifecycle,
+    acquisition::{ModelLifecycle, TtsLifecycle},
+    audio::{encode_float_wav, publish_exclusive, sealed_memfd},
     backend::to_transcribe_options,
-    domain::{ModelState, SophonError, Transcript, TranscriptionOptions},
+    config::TtsConfig,
+    domain::{ModelState, SophonError, Transcript, TranscriptionOptions, TtsRequest, TtsState},
+    playback::{PlaybackRequest, PlaybackWorker},
     postprocess::PostProcessingPipeline,
+    tts::TtsWorker,
     worker::ModelWorker,
 };
 
@@ -65,5 +69,85 @@ impl TranscriptionService {
             model: self.model.clone(),
         });
         Ok(transcript.final_text)
+    }
+}
+
+pub struct TtsService {
+    lifecycle: TtsLifecycle,
+    worker: TtsWorker,
+    playback: PlaybackWorker,
+    config: TtsConfig,
+}
+
+impl TtsService {
+    pub fn new(
+        lifecycle: TtsLifecycle,
+        worker: TtsWorker,
+        playback: PlaybackWorker,
+        config: TtsConfig,
+    ) -> Self {
+        Self {
+            lifecycle,
+            worker,
+            playback,
+            config,
+        }
+    }
+
+    fn ensure_ready(&self) -> Result<(), SophonError> {
+        match self.lifecycle.snapshot().state {
+            TtsState::Ready => Ok(()),
+            TtsState::Failed { .. } => Err(SophonError::ModelUnavailable(
+                "TTS model initialization failed".into(),
+            )),
+            _ => Err(SophonError::NotReady),
+        }
+    }
+
+    async fn synthesize(
+        &self,
+        request: TtsRequest,
+    ) -> Result<crate::domain::OwnedAudio, SophonError> {
+        self.ensure_ready()?;
+        self.worker.synthesize(request).await
+    }
+
+    pub async fn speak_to_file(
+        &self,
+        request: TtsRequest,
+        path: &Path,
+    ) -> Result<u64, SophonError> {
+        self.ensure_ready()?;
+        if !path.is_absolute() {
+            return Err(SophonError::OutputFailed(
+                "output path must be absolute".into(),
+            ));
+        }
+        if path.exists() {
+            return Err(SophonError::OutputExists(path.display().to_string()));
+        }
+        let audio = self.worker.synthesize(request).await?;
+        let wav = encode_float_wav(&audio, self.config.max_generated_audio_seconds)?;
+        publish_exclusive(path, &wav)
+    }
+
+    pub async fn speak_to_buffer(
+        &self,
+        request: TtsRequest,
+    ) -> Result<(OwnedFd, u64), SophonError> {
+        let audio = self.synthesize(request).await?;
+        let wav = encode_float_wav(&audio, self.config.max_generated_audio_seconds)?;
+        sealed_memfd(&wav)
+    }
+
+    pub async fn speak_aloud(&self, request: TtsRequest) -> Result<(), SophonError> {
+        let audio = self.synthesize(request).await?;
+        self.playback
+            .play(PlaybackRequest {
+                audio,
+                node_name: self.config.pipewire_node.clone(),
+                volume: self.config.volume as f32,
+            })
+            .await
     }
 }
