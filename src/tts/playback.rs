@@ -1,7 +1,6 @@
 //! CPAL PipeWire playback and serialized playback scheduling.
 
 use std::{
-    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -10,6 +9,9 @@ use std::{
     thread,
     time::Duration,
 };
+
+#[cfg(test)]
+use std::collections::VecDeque;
 
 use cpal::{
     DeviceId, HostId, Stream, StreamConfig,
@@ -142,6 +144,7 @@ impl SampleRing {
     }
 }
 
+#[cfg(test)]
 fn fill_ring_from_chunks(ring: &mut SampleRing, chunks: &mut VecDeque<(Vec<f32>, usize)>) {
     while let Some((samples, offset)) = chunks.front_mut() {
         let pushed = ring.push_slice(&samples[*offset..]);
@@ -152,6 +155,16 @@ fn fill_ring_from_chunks(ring: &mut SampleRing, chunks: &mut VecDeque<(Vec<f32>,
         if pushed == 0 {
             break;
         }
+    }
+}
+
+fn fill_ring_from_pending(ring: &mut SampleRing, pending: &mut Option<(Vec<f32>, usize)>) {
+    let Some((samples, offset)) = pending.as_mut() else {
+        return;
+    };
+    *offset += ring.push_slice(&samples[*offset..]);
+    if *offset == samples.len() {
+        *pending = None;
     }
 }
 
@@ -314,12 +327,12 @@ impl CpalPlayback {
         })
     }
 
-    fn fill_ring(session: &CpalSession, chunks: &mut VecDeque<(Vec<f32>, usize)>) {
+    fn fill_ring(session: &CpalSession, pending: &mut Option<(Vec<f32>, usize)>) {
         let mut ring = session
             .ring
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        fill_ring_from_chunks(&mut ring, chunks);
+        fill_ring_from_pending(&mut ring, pending);
     }
 }
 
@@ -341,12 +354,35 @@ impl SpeechPlayback for CpalPlayback {
         }
 
         let mut sample_rate = None;
-        let mut chunks = VecDeque::<(Vec<f32>, usize)>::new();
-        let mut session = None;
-        let mut terminal = None;
+        let mut pending = None;
+        let mut session: Option<CpalSession> = None;
+        let mut terminal: Option<()> = None;
 
         loop {
-            while terminal.is_none() {
+            if terminal.is_none()
+                && let Some(Err(error)) = request.stream.try_terminal()?
+            {
+                return Err(error);
+            }
+            if let Some(session) = &session {
+                if let Some(error) = session.failure() {
+                    return Err(SophonError::PlaybackFailed(error));
+                }
+                // Check the independent terminal result before adding pending samples.
+                Self::fill_ring(session, &mut pending);
+            }
+
+            if session.is_none() && pending.is_some() {
+                session = Some(self.open_session(
+                    request.output_device.as_ref(),
+                    sample_rate.expect("chunks require a format"),
+                    request.volume,
+                )?);
+                continue;
+            }
+
+            // Keep no more than one nonempty handoff chunk outside the ring.
+            while terminal.is_none() && pending.is_none() {
                 match request.stream.try_next() {
                     Ok(TtsStreamEvent::Format { sample_rate: rate }) => {
                         if rate == 0 || sample_rate.replace(rate).is_some() {
@@ -367,10 +403,14 @@ impl SpeechPlayback for CpalPlayback {
                             ));
                         }
                         if !samples.is_empty() {
-                            chunks.push_back((samples, 0));
+                            pending = Some((samples, 0));
                         }
                     }
-                    Ok(TtsStreamEvent::Terminal(result)) => terminal = Some(result),
+                    Ok(TtsStreamEvent::Terminal(result)) => {
+                        result?;
+                        terminal = Some(());
+                        break;
+                    }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         return Err(SophonError::SynthesisFailed(
@@ -380,24 +420,7 @@ impl SpeechPlayback for CpalPlayback {
                 }
             }
 
-            if session.is_none() && !chunks.is_empty() {
-                session = Some(self.open_session(
-                    request.output_device.as_ref(),
-                    sample_rate.expect("chunks require a format"),
-                    request.volume,
-                )?);
-            }
-            if let Some(session) = &session {
-                if let Some(error) = session.failure() {
-                    return Err(SophonError::PlaybackFailed(error));
-                }
-                Self::fill_ring(session, &mut chunks);
-            }
-
-            if let Some(result) = terminal.as_ref() {
-                if let Err(error) = result {
-                    return Err(error.clone());
-                }
+            if terminal.is_some() {
                 let Some(session) = &session else {
                     return Err(SophonError::PlaybackFailed(
                         "synthesis completed without audio".into(),
@@ -408,7 +431,7 @@ impl SpeechPlayback for CpalPlayback {
                 let deadline = session.deadline_nanos.load(Ordering::Acquire);
                 let now = session._stream.now().as_nanos();
                 if drain_complete(
-                    chunks.is_empty(),
+                    pending.is_none(),
                     ring_empty,
                     ring_generation,
                     submitted_generation,
@@ -433,12 +456,7 @@ mod tests {
     };
 
     fn stream(events: impl IntoIterator<Item = TtsStreamEvent>) -> TtsStream {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        for event in events {
-            sender.send(event).unwrap();
-        }
-        drop(sender);
-        TtsStream::from_receiver(receiver)
+        TtsStream::from_events(events)
     }
 
     #[test]

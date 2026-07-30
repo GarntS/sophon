@@ -3,7 +3,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{Cursor, Read, Seek, SeekFrom, Write},
-    os::fd::OwnedFd,
+    os::{fd::OwnedFd, unix::fs::OpenOptionsExt},
     path::Path,
 };
 
@@ -170,13 +170,22 @@ pub fn resample_mono(audio: OwnedAudio, target_rate: u32) -> Result<OwnedAudio, 
     })
 }
 
-pub fn read_file(path: &Path, max_bytes: u64, max_seconds: u64) -> Result<DecodedWav, SophonError> {
-    if !path.is_absolute() {
-        return Err(SophonError::InvalidAudio(
-            "audio path must be absolute".into(),
-        ));
-    }
-    let metadata = std::fs::metadata(path).map_err(|e| SophonError::InvalidAudio(e.to_string()))?;
+fn open_audio_file(path: &Path) -> Result<File, SophonError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| SophonError::InvalidAudio(error.to_string()))
+}
+
+fn read_open_audio_file(
+    file: File,
+    max_bytes: u64,
+    max_seconds: u64,
+) -> Result<DecodedWav, SophonError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| SophonError::InvalidAudio(error.to_string()))?;
     if !metadata.is_file() {
         return Err(SophonError::InvalidAudio(
             "audio path must identify a regular file".into(),
@@ -187,11 +196,16 @@ pub fn read_file(path: &Path, max_bytes: u64, max_seconds: u64) -> Result<Decode
             "encoded audio exceeds limit".into(),
         ));
     }
-    parse_wav(
-        File::open(path).map_err(|e| SophonError::InvalidAudio(e.to_string()))?,
-        max_bytes,
-        max_seconds,
-    )
+    parse_wav(file, max_bytes, max_seconds)
+}
+
+pub fn read_file(path: &Path, max_bytes: u64, max_seconds: u64) -> Result<DecodedWav, SophonError> {
+    if !path.is_absolute() {
+        return Err(SophonError::InvalidAudio(
+            "audio path must be absolute".into(),
+        ));
+    }
+    read_open_audio_file(open_audio_file(path)?, max_bytes, max_seconds)
 }
 
 /// Takes ownership of a transferred Unix descriptor, seeks it to byte zero,
@@ -402,7 +416,14 @@ pub fn sealed_memfd(wav: &[u8]) -> Result<(OwnedFd, u64), SophonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::{
+        ffi::CString,
+        io::Cursor,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
 
     fn wav(channels: u16, rate: u32, bits: u16, samples: usize) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());
@@ -613,6 +634,50 @@ mod tests {
         assert_eq!(read_file(file.path(), 100_000, 1).unwrap().samples.len(), 1);
         let fd: OwnedFd = File::open(file.path()).unwrap().into();
         assert_eq!(read_unix_fd(fd, 100_000, 1).unwrap().samples.len(), 1);
+    }
+
+    #[test]
+    fn opened_file_validation_and_parsing_stay_with_the_same_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio.wav");
+        let replacement = directory.path().join("replacement.wav");
+        let original = wav(1, 16_000, 16, 1);
+        std::fs::write(&path, &original).unwrap();
+        let file = open_audio_file(&path).unwrap();
+
+        std::fs::write(&replacement, wav(1, 16_000, 16, 100)).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let decoded = read_open_audio_file(file, original.len() as u64, 1).unwrap();
+        assert_eq!(decoded.samples.len(), 1);
+    }
+
+    #[test]
+    fn file_ingestion_follows_symlinks_to_regular_wavs() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.wav");
+        let link = directory.path().join("audio.wav");
+        std::fs::write(&target, wav(1, 16_000, 16, 1)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(read_file(&link, 100_000, 1).unwrap().samples.len(), 1);
+    }
+
+    #[test]
+    fn file_ingestion_rejects_fifos_without_waiting_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio.fifo");
+        let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path_cstr.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = mpsc::channel();
+        let fifo = path.clone();
+        let handle = thread::spawn(move || sender.send(read_file(&fifo, 100_000, 1)).unwrap());
+        let result = receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("opening a FIFO must not wait for a writer");
+        handle.join().unwrap();
+        assert!(matches!(result, Err(SophonError::InvalidAudio(_))));
     }
 
     #[test]

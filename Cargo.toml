@@ -16,10 +16,8 @@ qwen-cuda = ["dep:qwentts-cpp", "qwentts-cpp/cuda"]
 qwen-vulkan = ["dep:qwentts-cpp", "qwentts-cpp/vulkan"]
 
 [dependencies]
-async-trait = "=0.1.89"
 cpal = { version = "=0.18.1", default-features = false, features = ["pipewire"] }
 directories = "=6.0.0"
-flate2 = "=1.1.5"
 fs2 = "=0.4.3"
 futures-util = "=0.3.31"
 hound = "=3.5.1"
@@ -29,18 +27,14 @@ qwentts-cpp = { path = "crates/qwentts-cpp", version = "=2026.1.0", default-feat
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
 rubato = "=4.0.0"
 serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.145"
 serde_yaml = "=0.9.34+deprecated"
 sha2 = "=0.10.9"
-tar = "=0.4.44"
 tempfile = "=3.25.0"
 thiserror = "=2.0.17"
 tokio = { version = "=1.48.0", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 # Vendored to align Kokoro with the same download-free ORT rc.12 API used by STT.
 tts-rs = { version = "=2026.2.3", path = "third_party/tts-rs", default-features = false, features = ["kokoro"] }
 tracing = "=0.1.41"
-tracing-subscriber = { version = "=0.3.20", features = ["env-filter"] }
-xz2 = "=0.1.7"
 zbus = { version = "=5.18.0", default-features = false, features = ["tokio"] }
 
 # The default `ort` feature set downloads prebuilt ONNX Runtime binaries. Keep

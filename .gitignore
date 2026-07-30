@@ -11,3 +11,4 @@ __pycache__/
 
 # pi-agent nonsense
 .pi/
+.pi-subagents/
