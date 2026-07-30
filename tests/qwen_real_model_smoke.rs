@@ -1,20 +1,13 @@
 #![cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
 
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::{env, path::PathBuf};
 
 use sophon::{
-    acquisition::{
-        QWEN_06B_BASE, QWEN_06B_CUSTOM_VOICE, QWEN_17B_VOICE_DESIGN, ResolvedQwenModel,
-        TtsModelDefinition,
-    },
+    audio::OwnedAudio,
     config::QwenSamplingConfig,
-    domain::{OwnedAudio, TtsRequest, VoiceIntent},
     tts::{
         QwenEngineAdapter, QwenTtsBaseProvider, QwenTtsCustomVoiceProvider,
-        QwenTtsVoiceDesignProvider, TtsProvider,
+        QwenTtsVoiceDesignProvider, TtsProvider, TtsRequest, VoiceIntent,
     },
 };
 
@@ -22,19 +15,6 @@ fn required_path(name: &str) -> PathBuf {
     env::var_os(name)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("set {name} to run the ignored Qwen real-model smoke test"))
-}
-
-fn resolved(
-    definition: &'static TtsModelDefinition,
-    talker_env: &str,
-    codec: &Path,
-) -> ResolvedQwenModel {
-    ResolvedQwenModel {
-        definition,
-        metadata: definition.qwen.expect("Qwen metadata"),
-        talker_path: required_path(talker_env),
-        codec_path: codec.to_path_buf(),
-    }
 }
 
 fn request(voice: VoiceIntent) -> TtsRequest {
@@ -61,9 +41,9 @@ fn real_qwen_modes_produce_finite_nonempty_24khz_audio() {
         ..QwenSamplingConfig::default()
     };
 
-    let base_model = resolved(&QWEN_06B_BASE, "SOPHON_QWEN_BASE_TALKER", &codec);
-    let base_engine = QwenEngineAdapter::load(&base_model, &sampling, 30).unwrap();
-    let mut base = QwenTtsBaseProvider::new(base_engine, base_model.definition.id, 16 * 1024);
+    let base_talker = required_path("SOPHON_QWEN_BASE_TALKER");
+    let base_engine = QwenEngineAdapter::load(&base_talker, &codec, &sampling, 30).unwrap();
+    let mut base = QwenTtsBaseProvider::new(base_engine, "qwen3-tts-0.6b-base-q8_0", 16 * 1024);
     assert_audio(base.synthesize(&request(VoiceIntent::Default)).unwrap());
     let reference = OwnedAudio {
         samples: (0..24_000 * 3)
@@ -82,15 +62,11 @@ fn real_qwen_modes_produce_finite_nonempty_24khz_audio() {
         .unwrap(),
     );
 
-    let custom_model = resolved(
-        &QWEN_06B_CUSTOM_VOICE,
-        "SOPHON_QWEN_CUSTOM_VOICE_TALKER",
-        &codec,
-    );
-    let custom_engine = QwenEngineAdapter::load(&custom_model, &sampling, 30).unwrap();
+    let custom_talker = required_path("SOPHON_QWEN_CUSTOM_VOICE_TALKER");
+    let custom_engine = QwenEngineAdapter::load(&custom_talker, &codec, &sampling, 30).unwrap();
     let mut custom = QwenTtsCustomVoiceProvider::new(
         custom_engine,
-        custom_model.definition.id,
+        "qwen3-tts-0.6b-custom-voice-q8_0",
         "vivian",
         16 * 1024,
     )
@@ -101,15 +77,11 @@ fn real_qwen_modes_produce_finite_nonempty_24khz_audio() {
             .unwrap(),
     );
 
-    let design_model = resolved(
-        &QWEN_17B_VOICE_DESIGN,
-        "SOPHON_QWEN_VOICE_DESIGN_TALKER",
-        &codec,
-    );
-    let design_engine = QwenEngineAdapter::load(&design_model, &sampling, 30).unwrap();
+    let design_talker = required_path("SOPHON_QWEN_VOICE_DESIGN_TALKER");
+    let design_engine = QwenEngineAdapter::load(&design_talker, &codec, &sampling, 30).unwrap();
     let mut design = QwenTtsVoiceDesignProvider::new(
         design_engine,
-        design_model.definition.id,
+        "qwen3-tts-1.7b-voice-design-q8_0",
         "A warm, clear, natural adult voice with moderate pitch and pace.",
         16 * 1024,
     );

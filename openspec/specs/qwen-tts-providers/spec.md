@@ -1,34 +1,34 @@
 ## Requirements
 
 ### Requirement: Mode-specific Qwen providers
-Sophon SHALL provide Base, CustomVoice, and VoiceDesign Qwen TTS implementations under provider ID `qwentts-cpp`, and each implementation SHALL advertise and accept only the voice intents supported by its loaded checkpoint mode.
+Sophon SHALL provide Base, CustomVoice, and VoiceDesign models under provider ID `qwentts-cpp`; each registered model kind SHALL advertise and accept only supported voice intents. Startup-validated configuration SHALL provide mode-specific defaults, and a valid request-level intent SHALL override the corresponding default for that request only.
 
 #### Scenario: Base model is ready
-- **WHEN** a curated Base model loads successfully
-- **THEN** Sophon advertises one-shot voice cloning, does not advertise named voices or voice design, and accepts default or clone intents
+- **WHEN** a registered Base model loads successfully
+- **THEN** Sophon advertises one-shot voice cloning and accepts default or clone intents, using configured default clone reference data when no request clone is supplied
 
 #### Scenario: CustomVoice model is ready
-- **WHEN** a curated CustomVoice model loads successfully
-- **THEN** Sophon advertises named voices from the model, uses its configured default speaker when no intent is supplied, and does not advertise cloning or voice design
+- **WHEN** a registered CustomVoice model loads successfully
+- **THEN** Sophon advertises named voices and uses the configured default speaker when no request voice is supplied
 
 #### Scenario: VoiceDesign model is ready
-- **WHEN** a curated VoiceDesign model loads successfully
-- **THEN** Sophon advertises voice design, does not advertise named voices or cloning, and uses the configured default description when no per-request description is supplied
+- **WHEN** a registered VoiceDesign model loads successfully
+- **THEN** Sophon advertises voice design and uses the configured default prompt when no request description is supplied
 
-#### Scenario: Request description overrides the default
-- **WHEN** a VoiceDesign request supplies a valid `voice_description`
-- **THEN** Sophon uses that description for only that synthesis instead of the configured default
+#### Scenario: Request intent overrides configured default
+- **WHEN** a request supplies a valid clone reference, named voice, or voice description supported by the selected model kind
+- **THEN** Sophon uses that request value for only that synthesis
 
-### Requirement: Curated Q8_0 Qwen catalog
-Sophon SHALL register the 0.6B and 1.7B Base, 0.6B and 1.7B CustomVoice, and 1.7B VoiceDesign Q8_0 talkers plus the shared Q8_0 codec from immutable revision `e0f336a048a3de02b29b8ad92969217d9ecffe3e` of `Serveurperso/Qwen3-TTS-GGUF`. Every artifact SHALL have an exact expected size and SHA-256 digest.
+### Requirement: Package-defined Q8_0 Qwen catalog
+The package registry SHALL define the 0.6B and 1.7B Base, 0.6B and 1.7B CustomVoice, and 1.7B VoiceDesign Q8_0 models under `qwentts-cpp`, with semantic `talker` and shared `codec` roles from immutable revision `e0f336a048a3de02b29b8ad92969217d9ecffe3e`; every artifact SHALL retain its exact expected size and SHA-256 digest.
 
-#### Scenario: Any curated model is selected
+#### Scenario: Any packaged model is selected
 - **WHEN** configuration selects one of the five registered Qwen model IDs
-- **THEN** Sophon resolves its exact talker and the shared codec and verifies both before loading
+- **THEN** the registry resolves its talker and shared codec and verifies both before loading
 
 #### Scenario: Unregistered Qwen model is selected
-- **WHEN** configuration names another size, mode, quantization, revision, or arbitrary local GGUF
-- **THEN** TTS configuration or initialization fails without loading or downloading an alternative
+- **WHEN** configuration names another model ID
+- **THEN** TTS state becomes terminal `Failed` without loading or downloading an alternative
 
 ### Requirement: Conservative Qwen language handling
 An omitted Qwen language SHALL select native automatic detection. Sophon SHALL case-insensitively normalize documented base and regional tags for English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, and Italian, and SHALL reject unknown tags without falling back to English.

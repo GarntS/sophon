@@ -217,8 +217,8 @@ class SophonClient:
     async def tts_state(self) -> str:
         return str(await self.get_property("TtsState"))
 
-    async def active_engine(self) -> str:
-        return str(await self.get_property("ActiveEngine"))
+    async def active_provider(self) -> str:
+        return str(await self.get_property("ActiveProvider"))
 
     async def active_model(self) -> str:
         return str(await self.get_property("ActiveModel"))

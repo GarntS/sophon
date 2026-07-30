@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::oneshot;
 use transcribe_rs::{SpeechModel, TranscribeOptions};
 
-use crate::domain::SophonError;
+use crate::error::SophonError;
 
 struct WorkItem {
     samples: Vec<f32>,
@@ -17,11 +17,11 @@ struct WorkItem {
 }
 
 #[derive(Clone)]
-pub struct ModelWorker {
+pub struct STTWorker {
     sender: SyncSender<WorkItem>,
 }
 
-impl ModelWorker {
+impl STTWorker {
     pub fn new(mut model: Box<dyn SpeechModel>, capacity: usize) -> Self {
         let (sender, receiver) = sync_channel::<WorkItem>(capacity);
         thread::Builder::new()
@@ -111,7 +111,7 @@ mod tests {
     #[tokio::test]
     async fn serializes_work_and_continues_after_an_inference_failure() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let worker = ModelWorker::new(
+        let worker = STTWorker::new(
             Box::new(FixtureModel {
                 calls: calls.clone(),
                 fail_first: true,
@@ -136,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_work_when_the_bounded_queue_is_full() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let worker = ModelWorker::new(
+        let worker = STTWorker::new(
             Box::new(FixtureModel {
                 calls,
                 fail_first: false,

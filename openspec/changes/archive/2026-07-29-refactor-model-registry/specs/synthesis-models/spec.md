@@ -1,26 +1,4 @@
-## ADDED Requirements
-
-### Requirement: Provider-neutral TTS behavior
-Sophon SHALL represent synthesis requests, provider capabilities, voice names, and owned PCM results independently of a specific TTS engine. Providers SHALL return owned mono `f32` samples with a sample rate and SHALL distinguish default, named, one-shot clone, and voice-design intents.
-
-#### Scenario: Provider result is consumed by any output
-- **WHEN** a provider returns successful owned PCM
-- **THEN** the same result can be encoded to a file or memfd or submitted to playback without provider-specific output behavior
-
-#### Scenario: Alternate provider is added
-- **WHEN** an engine supports the provider-neutral requests and owned result contract
-- **THEN** it can be integrated without changing the three D-Bus synthesis method signatures
-
-### Requirement: Initial Kokoro provider
-The initial active implementation SHALL use the Kokoro engine from `tts-rs`, SHALL support its named voices and speed control, and SHALL accurately report that one-shot cloning and voice design are unsupported.
-
-#### Scenario: Kokoro named voice synthesis succeeds
-- **WHEN** a caller selects a voice exposed by the loaded Kokoro model with valid text and speed
-- **THEN** Sophon submits that selection to `tts-rs` and returns its mono 24 kHz `f32` result or a concrete synthesis failure
-
-#### Scenario: Kokoro cloning is rejected
-- **WHEN** a caller requests one-shot cloning from the Kokoro provider
-- **THEN** Sophon returns `UnsupportedCapability` before invoking Kokoro inference
+## MODIFIED Requirements
 
 ### Requirement: Verified automatic Kokoro acquisition
 Sophon SHALL define Kokoro in the package-installed model registry with every required model and voice sidecar role, immutable upstream location, revision metadata, relative path, size, and SHA-256 digest. The registry SHALL automatically download missing artifacts and expose only complete verified role paths to the Kokoro provider.
@@ -36,17 +14,6 @@ Sophon SHALL define Kokoro in the package-installed model registry with every re
 #### Scenario: Download or checksum fails
 - **WHEN** an artifact download is interrupted or has a mismatched digest
 - **THEN** no partial model becomes loadable and TTS state remains terminal `Failed` until restart
-
-### Requirement: Bounded serialized TTS inference
-The active mutable TTS provider SHALL process accepted synthesis requests in FIFO order through one bounded queue and SHALL continue serving later requests after an individual synthesis failure.
-
-#### Scenario: Concurrent requests are accepted
-- **WHEN** multiple synthesis requests fit within queue capacity
-- **THEN** provider inference processes them serially in acceptance order
-
-#### Scenario: One request fails
-- **WHEN** provider inference fails for one accepted request
-- **THEN** that caller receives `SynthesisFailed` and the worker processes the next queued request
 
 ### Requirement: Independent observable TTS lifecycle
 The D-Bus interface SHALL expose read-only TTS state, active provider/model identity, download progress, last error, available voices, and capabilities sourced from the long-lived TTS provider handle and SHALL emit standard property changes. TTS states SHALL be `Initializing`, `Downloading`, `Loading`, `Ready`, and `Failed`.
@@ -88,3 +55,10 @@ A TTS model composed from multiple shared artifacts SHALL become loadable only w
 #### Scenario: One composite artifact cannot be acquired
 - **WHEN** either artifact is absent and its single download attempt fails
 - **THEN** TTS state becomes terminal `Failed` without treating the partial model as ready
+
+## REMOVED Requirements
+
+### Requirement: Curated-only TTS model overrides
+**Reason**: Local model overrides are removed; all model files are selected from the package registry and verified shared cache.
+
+**Migration**: Package the desired curated model in `model_registry.yaml` and pre-populate verified cache blobs when necessary.

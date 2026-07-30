@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Configurable Parakeet and Canary backends
 The service SHALL support selecting a registered STT provider/model pair whose package metadata kind is `parakeet` or `canary`, and SHALL load exactly one configured active STT model per daemon process.
@@ -30,21 +30,6 @@ The service SHALL resolve the configured STT provider/model pair through the pac
 - **WHEN** configuration specifies a provider/model pair absent from the package registry
 - **THEN** STT state becomes terminal `Failed` and the error identifies the unknown pair
 
-### Requirement: Safe cache installation
-Automatic acquisition SHALL use a cross-process lock, temporary storage, SHA-256 verification, expected-layout validation, and atomic publication. Partial or invalid artifacts SHALL NOT be treated as cached models.
-
-#### Scenario: Digest verification fails
-- **WHEN** downloaded bytes do not match the registry SHA-256 digest
-- **THEN** the artifact is rejected, model state becomes `Failed`, and no completed cache directory is published
-
-#### Scenario: Download is interrupted
-- **WHEN** acquisition terminates before successful verification and publication
-- **THEN** a later daemon run does not treat the partial artifact as a valid model
-
-#### Scenario: Two daemon processes acquire the same model
-- **WHEN** acquisition for one model ID is attempted concurrently
-- **THEN** locking prevents both processes from publishing conflicting cache contents
-
 ### Requirement: Observable model lifecycle
 The D-Bus interface SHALL expose read-only `State`, active provider/model identity, `DownloadProgress`, and `LastError` properties sourced from the STT provider handle and SHALL emit property-change notifications when observable values change.
 
@@ -56,17 +41,9 @@ The D-Bus interface SHALL expose read-only `State`, active provider/model identi
 - **WHEN** registry resolution or provider loading fails
 - **THEN** state becomes terminal `Failed`, `LastError` contains an actionable description, and a property-change notification is emitted
 
-### Requirement: Hardware accelerator policy
-The service SHALL support `auto`, `cpu`, `cuda`, and `rocm` accelerator configuration subject to providers compiled into the installed package. `auto` SHALL allow CPU fallback; explicitly requested unavailable providers SHALL fail model initialization.
+## REMOVED Requirements
 
-#### Scenario: Auto acceleration has no usable GPU provider
-- **WHEN** acceleration is `auto` and no compiled GPU provider can initialize
-- **THEN** the service loads the active model with the CPU provider
+### Requirement: Model path override
+**Reason**: Model files are exclusively defined by the package registry and verified shared cache.
 
-#### Scenario: Explicit provider is unavailable
-- **WHEN** configuration explicitly requests CUDA or ROCm but that provider is not compiled or cannot initialize
-- **THEN** model state becomes `Failed` rather than silently using CPU
-
-#### Scenario: Explicit available provider initializes
-- **WHEN** configuration requests a compiled and operational GPU provider
-- **THEN** the active model uses that provider for ONNX inference
+**Migration**: Add the desired curated model to the package registry and pre-populate its verified cache when offline operation is required.

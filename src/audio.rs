@@ -10,7 +10,13 @@ use std::{
 use hound::{SampleFormat, WavReader};
 use memfd::{FileSeal, MemfdOptions};
 
-use crate::domain::{OwnedAudio, SophonError};
+use crate::error::SophonError;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnedAudio {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
 
 pub fn parse_wav<R: Read>(
     reader: R,

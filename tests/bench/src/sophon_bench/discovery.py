@@ -115,7 +115,7 @@ class DaemonConfig:
 async def discover_config(client: SophonClient) -> DaemonConfig:
     """Read the daemon's published lifecycle properties."""
     return DaemonConfig(
-        engine=await client.active_engine(),
+        engine=await client.active_provider(),
         model=await client.active_model(),
         tts_provider=await client.active_tts_provider(),
         tts_model=await client.active_tts_model(),

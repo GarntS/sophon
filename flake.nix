@@ -105,7 +105,7 @@
                 ++ pkgs.lib.optionals (qwenBackend == "vulkan") [ pkgs.vulkan-loader ];
             in pkgs.rustPlatform.buildRustPackage {
               pname = name;
-              version = "2026.1.1";
+              version = "2026.1.2";
               src = self;
               cargoLock.lockFile = ./Cargo.lock;
               cargoBuildFlags = [ "--bins" ] ++ featureFlags;
@@ -153,6 +153,8 @@
                 test -f $out/lib/libggml-${qwenBackend}.so || test "${qwenBackend}" = cpu
                 test -f $out/lib/libggml-cpu.so || test "${qwenBackend}" != cpu
 
+                install -Dm444 model_registry.yaml $out/share/sophon/model_registry.yaml
+
                 mkdir -p $out/share/dbus-1/services
                 cat > $out/share/dbus-1/services/com.garntresearch.sophon.service <<EOF
                 [D-BUS Service]
@@ -169,6 +171,7 @@
                   patchelf --add-rpath "\$ORIGIN/../lib:$externalRpath" "$binary"
                 done
                 wrapProgram $out/bin/sophon \
+                  --set SOPHON_MODEL_REGISTRY_PATH $out/share/sophon/model_registry.yaml \
                   --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.espeak-ng ]}
               '';
               passthru.qwenBackend = qwenBackend;
@@ -305,6 +308,15 @@
               touch $out
             '';
         in {
+          model-registry = pkgs.runCommand "sophon-model-registry" { nativeBuildInputs = [ pkgs.yq ]; } ''
+            registry=${self.packages.${system}.sophon-cpu}/share/sophon/model_registry.yaml
+            test -f "$registry"
+            test "$(stat -c %a "$registry")" = 444
+            yq -e '.providers."transcribe-rs"."parakeet-tdt-0.6b-v3-int8".files.encoder.sha256 == "6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09"' "$registry"
+            yq -e '.providers."qwentts-cpp" | length == 5' "$registry"
+            yq -e '[.providers."qwentts-cpp"[].files.codec.sha256] | unique | length == 1' "$registry"
+            touch $out
+          '';
           qwentts-cpp-cpu-runtime = pkgs.runCommand "qwentts-cpp-cpu-runtime" {} ''
             test -f ${qwenttsCpu}/lib/libqwen.so
             test -f ${qwenttsCpu}/lib/libggml.so

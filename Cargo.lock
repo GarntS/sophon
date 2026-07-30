@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "sophon"
-version = "2026.1.1"
+version = "2026.1.2"
 dependencies = [
  "async-trait",
  "directories",

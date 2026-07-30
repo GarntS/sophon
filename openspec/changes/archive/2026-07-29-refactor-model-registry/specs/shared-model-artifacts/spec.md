@@ -1,4 +1,4 @@
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Content-addressed shared artifacts
 The singleton model registry SHALL store package-defined model files beneath a shared `artifacts` cache keyed by SHA-256 digest, and model manifests SHALL resolve required semantic file roles by verified artifact identity so identical files, including the Qwen codec, occupy one cache entry.

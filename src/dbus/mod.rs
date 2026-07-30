@@ -1,17 +1,21 @@
 //! Session-bus object exported by the daemon.
 
+pub mod transport;
+
 use std::{collections::HashMap, os::fd::OwnedFd, sync::Arc};
 
 use zbus::{DBusError, zvariant::OwnedValue};
 
 use crate::{
-    acquisition::{ModelLifecycle, TtsLifecycle},
     audio::{read_file, read_unix_fd},
     config::TtsConfig,
-    domain::{ModelState, SophonError, TranscriptionOptions, TtsState},
-    service::{TranscriptionService, TtsService},
-    transport::{OptionValue, TtsOptionValue, decode_options, decode_tts_options},
+    error::SophonError,
+    provider_runtime::{ModelState, SttProviderHandle, TtsProviderHandle},
+    stt::{STTService, TranscriptionOptions},
+    tts::{TtsRequest, TtsService},
 };
+
+use self::transport::{OptionValue, TtsOptionValue, decode_options, decode_tts_options};
 
 fn decode_dbus_tts_values(
     values: HashMap<String, OwnedValue>,
@@ -91,51 +95,45 @@ impl From<SophonError> for SophonDbusError {
 
 pub struct SophonDbus {
     defaults: TranscriptionOptions,
-    lifecycle: ModelLifecycle,
-    service: Option<Arc<TranscriptionService>>,
+    stt_handle: SttProviderHandle,
     max_audio_bytes: u64,
     max_audio_seconds: u64,
     tts_config: Option<TtsConfig>,
-    tts_lifecycle: TtsLifecycle,
-    tts_service: Option<Arc<TtsService>>,
+    tts_handle: TtsProviderHandle,
 }
 
 impl SophonDbus {
     pub fn unavailable(
         defaults: TranscriptionOptions,
-        lifecycle: ModelLifecycle,
+        stt_handle: SttProviderHandle,
+        tts_handle: TtsProviderHandle,
         max_audio_bytes: u64,
         max_audio_seconds: u64,
     ) -> Self {
         Self {
             defaults,
-            lifecycle,
-            service: None,
+            stt_handle,
             max_audio_bytes,
             max_audio_seconds,
             tts_config: None,
-            tts_lifecycle: TtsLifecycle::new(),
-            tts_service: None,
+            tts_handle,
         }
     }
 
     pub fn ready(
         defaults: TranscriptionOptions,
-        lifecycle: ModelLifecycle,
-        service: Arc<TranscriptionService>,
+        stt_handle: SttProviderHandle,
+        tts_handle: TtsProviderHandle,
         max_audio_bytes: u64,
         max_audio_seconds: u64,
     ) -> Self {
-        Self {
+        Self::unavailable(
             defaults,
-            lifecycle,
-            service: Some(service),
+            stt_handle,
+            tts_handle,
             max_audio_bytes,
             max_audio_seconds,
-            tts_config: None,
-            tts_lifecycle: TtsLifecycle::new(),
-            tts_service: None,
-        }
+        )
     }
 
     fn options(
@@ -144,15 +142,10 @@ impl SophonDbus {
     ) -> Result<TranscriptionOptions, SophonDbusError> {
         let mut decoded = std::collections::BTreeMap::new();
         for (key, value) in values {
-            if let Ok(value) = String::try_from(value.clone()) {
-                decoded.insert(key, OptionValue::String(value));
-            } else if let Ok(value) = bool::try_from(value) {
-                decoded.insert(key, OptionValue::Bool(value));
-            } else {
-                return Err(SophonDbusError::InvalidOptions(
-                    "unsupported option type".into(),
-                ));
-            }
+            let value = String::try_from(value).map_err(|_| {
+                SophonDbusError::InvalidOptions(format!("option `{key}` must be a string"))
+            })?;
+            decoded.insert(key, OptionValue::String(value));
         }
         decode_options(decoded, &self.defaults).map_err(Into::into)
     }
@@ -160,45 +153,32 @@ impl SophonDbus {
     pub fn install(
         &mut self,
         defaults: TranscriptionOptions,
-        service: Arc<TranscriptionService>,
         max_audio_bytes: u64,
         max_audio_seconds: u64,
     ) {
         self.defaults = defaults;
-        self.service = Some(service);
         self.max_audio_bytes = max_audio_bytes;
         self.max_audio_seconds = max_audio_seconds;
     }
 
-    pub fn set_tts_lifecycle(&mut self, lifecycle: TtsLifecycle) {
-        self.tts_lifecycle = lifecycle;
-    }
-
-    pub fn install_tts(
-        &mut self,
-        config: TtsConfig,
-        lifecycle: TtsLifecycle,
-        service: Arc<TtsService>,
-    ) {
+    pub fn install_tts(&mut self, config: TtsConfig) {
         self.tts_config = Some(config);
-        self.tts_lifecycle = lifecycle;
-        self.tts_service = Some(service);
     }
 
-    fn service(&self) -> Result<&Arc<TranscriptionService>, SophonDbusError> {
-        self.service
-            .as_ref()
-            .ok_or_else(|| match self.lifecycle.snapshot().state {
+    fn service(&self) -> Result<Arc<STTService>, SophonDbusError> {
+        self.stt_handle
+            .service()
+            .ok_or_else(|| match self.stt_handle.state() {
                 ModelState::Failed { message } => SophonDbusError::ModelUnavailable(message),
                 _ => SophonDbusError::NotReady("model is not ready".into()),
             })
     }
 
-    fn tts_service(&self) -> Result<&Arc<TtsService>, SophonDbusError> {
-        self.tts_service
-            .as_ref()
-            .ok_or_else(|| match self.tts_lifecycle.snapshot().state {
-                TtsState::Failed { message } => SophonDbusError::ModelUnavailable(message),
+    fn tts_service(&self) -> Result<Arc<TtsService>, SophonDbusError> {
+        self.tts_handle
+            .service()
+            .ok_or_else(|| match self.tts_handle.state() {
+                ModelState::Failed { message } => SophonDbusError::ModelUnavailable(message),
                 _ => SophonDbusError::NotReady("TTS model is not ready".into()),
             })
     }
@@ -207,12 +187,12 @@ impl SophonDbus {
         &self,
         text: &str,
         values: HashMap<String, OwnedValue>,
-    ) -> Result<crate::domain::TtsRequest, SophonDbusError> {
+    ) -> Result<TtsRequest, SophonDbusError> {
         let config = self
             .tts_config
             .as_ref()
             .ok_or_else(|| SophonDbusError::NotReady("TTS configuration is not ready".into()))?;
-        let snapshot = self.tts_lifecycle.snapshot();
+        let snapshot = self.tts_handle.snapshot();
         decode_tts_options(
             text,
             decode_dbus_tts_values(values)?,
@@ -232,7 +212,7 @@ impl SophonDbus {
         let emitter = interface.signal_emitter();
         let iface = interface.get().await;
         iface.state_changed(emitter).await?;
-        iface.active_engine_changed(emitter).await?;
+        iface.active_provider_changed(emitter).await?;
         iface.active_model_changed(emitter).await?;
         iface.download_progress_changed(emitter).await?;
         iface.last_error_changed(emitter).await?;
@@ -252,6 +232,16 @@ impl SophonDbus {
         iface.available_voices_changed(emitter).await?;
         iface.tts_capabilities_changed(emitter).await?;
         Ok(())
+    }
+}
+
+fn state_name(state: ModelState) -> String {
+    match state {
+        ModelState::Initializing => "Initializing".into(),
+        ModelState::Downloading { .. } => "Downloading".into(),
+        ModelState::Loading => "Loading".into(),
+        ModelState::Ready => "Ready".into(),
+        ModelState::Failed { .. } => "Failed".into(),
     }
 }
 
@@ -326,49 +316,41 @@ impl SophonDbus {
 
     #[zbus(property)]
     fn tts_state(&self) -> String {
-        match self.tts_lifecycle.snapshot().state {
-            TtsState::Initializing => "Initializing".into(),
-            TtsState::Downloading { .. } => "Downloading".into(),
-            TtsState::Loading => "Loading".into(),
-            TtsState::Ready => "Ready".into(),
-            TtsState::Failed { .. } => "Failed".into(),
-        }
+        state_name(self.tts_handle.state())
     }
 
     #[zbus(property)]
     fn active_tts_provider(&self) -> String {
-        self.tts_lifecycle
-            .snapshot()
-            .active_provider
-            .unwrap_or_default()
+        self.tts_handle.snapshot().provider.active_provider
     }
 
     #[zbus(property)]
     fn active_tts_model(&self) -> String {
-        self.tts_lifecycle
-            .snapshot()
-            .active_model
-            .unwrap_or_default()
+        self.tts_handle.snapshot().provider.active_model
     }
 
     #[zbus(property)]
     fn tts_download_progress(&self) -> f64 {
-        self.tts_lifecycle.snapshot().download_progress as f64
+        self.tts_handle.snapshot().provider.download_progress as f64
     }
 
     #[zbus(property)]
     fn tts_last_error(&self) -> String {
-        self.tts_lifecycle.snapshot().last_error.unwrap_or_default()
+        self.tts_handle
+            .snapshot()
+            .provider
+            .last_error
+            .unwrap_or_default()
     }
 
     #[zbus(property)]
     fn available_voices(&self) -> Vec<String> {
-        self.tts_lifecycle.snapshot().available_voices
+        self.tts_handle.snapshot().available_voices
     }
 
     #[zbus(property)]
     fn tts_capabilities(&self) -> Vec<String> {
-        let capabilities = self.tts_lifecycle.snapshot().capabilities;
+        let capabilities = self.tts_handle.snapshot().capabilities;
         let mut values = Vec::new();
         if capabilities.named_voices {
             values.push("named-voices".into());
@@ -387,33 +369,23 @@ impl SophonDbus {
 
     #[zbus(property)]
     fn state(&self) -> String {
-        match self.lifecycle.snapshot().state {
-            ModelState::Initializing => "Initializing".into(),
-            ModelState::Downloading { .. } => "Downloading".into(),
-            ModelState::Loading => "Loading".into(),
-            ModelState::Ready => "Ready".into(),
-            ModelState::Failed { .. } => "Failed".into(),
-        }
+        state_name(self.stt_handle.state())
     }
 
     #[zbus(property)]
-    fn active_engine(&self) -> String {
-        self.lifecycle
-            .snapshot()
-            .active_engine
-            .map(|engine| format!("{engine:?}").to_lowercase())
-            .unwrap_or_default()
+    fn active_provider(&self) -> String {
+        self.stt_handle.snapshot().active_provider
     }
     #[zbus(property)]
     fn active_model(&self) -> String {
-        self.lifecycle.snapshot().active_model.unwrap_or_default()
+        self.stt_handle.snapshot().active_model
     }
     #[zbus(property)]
     fn download_progress(&self) -> f64 {
-        self.lifecycle.snapshot().download_progress as f64
+        self.stt_handle.snapshot().download_progress as f64
     }
     #[zbus(property)]
     fn last_error(&self) -> String {
-        self.lifecycle.snapshot().last_error.unwrap_or_default()
+        self.stt_handle.snapshot().last_error.unwrap_or_default()
     }
 }

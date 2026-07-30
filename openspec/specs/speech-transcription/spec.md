@@ -45,19 +45,15 @@ The service SHALL accept only complete RIFF/WAVE audio containing one channel, a
 - **THEN** the method returns an `InvalidAudio` error describing the incompatible property
 
 ### Requirement: Per-request transcription options
-Both transcription methods SHALL accept an `a{sv}` options dictionary recognizing `language` as a string and `translate` as a boolean. Omitted values SHALL use configured defaults, and `translate=true` SHALL mean translation to English.
+Both transcription methods SHALL accept an `a{sv}` options dictionary recognizing only `language` as a string. An omitted language SHALL use the configured default, and the selected language SHALL be validated against registry metadata for the active model.
 
 #### Scenario: Request language overrides the default
-- **WHEN** a client supplies a supported `language` value
-- **THEN** that language is used for the request without reloading the active model
-
-#### Scenario: Translation is requested on a capable model
-- **WHEN** a client supplies `translate=true` and the active model supports translation
-- **THEN** the returned text is translated to English without reloading the model
+- **WHEN** a client supplies a language supported by the active model
+- **THEN** that language is used for the request without reloading the model
 
 #### Scenario: Invalid option is rejected
-- **WHEN** options contain an unknown key, a value of the wrong type, an unsupported language, or translation unsupported by the active model
-- **THEN** the method returns an `InvalidOptions` error without queueing inference
+- **WHEN** options contain an unknown key, a value of the wrong type, or an unsupported language
+- **THEN** the method returns `InvalidOptions` without queueing inference
 
 ### Requirement: Bounded short-recording workload
 The service SHALL enforce configurable encoded-size, decoded-duration, and queue-capacity limits. Defaults SHALL be 32 MiB, 10 minutes, and 8 queued requests respectively.

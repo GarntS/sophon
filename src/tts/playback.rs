@@ -19,7 +19,7 @@ use pw::{
     types::ObjectType,
 };
 
-use crate::domain::{OwnedAudio, SophonError};
+use crate::{audio::OwnedAudio, error::SophonError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaybackRequest {

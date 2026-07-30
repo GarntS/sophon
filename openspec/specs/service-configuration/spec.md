@@ -12,33 +12,33 @@ At startup, the service SHALL read `sophon/config.yaml` beneath `$XDG_CONFIG_HOM
 - **THEN** the service looks for configuration at `~/.config/sophon/config.yaml`
 
 ### Requirement: Documented defaults
-When no configuration file exists, the service SHALL use documented defaults selecting a pinned Parakeet int8 model, automatic model acquisition, automatic acceleration, English transcription, translation disabled, a 32 MiB input limit, a 10-minute duration limit, and queue capacity 8.
+When no configuration file exists, the service SHALL use documented defaults selecting a registered STT provider/model pair, automatic acceleration, English transcription, a 32 MiB input limit, a 10-minute duration limit, and queue capacity 8.
 
 #### Scenario: First run without configuration
 - **WHEN** the discovered configuration path does not exist
-- **THEN** the daemon starts model acquisition using all documented defaults
+- **THEN** the daemon initializes the default provider handle and registry model using all documented defaults
 
 ### Requirement: Supported configuration
-The YAML configuration SHALL support active engine, model ID, optional model path, quantization, accelerator, default language, default translation, model cache directory, automatic-download policy, maximum audio bytes, maximum audio duration, queue capacity, and logging verbosity.
+The YAML configuration SHALL support STT provider and model IDs, accelerator, default language, shared model cache directory, maximum audio bytes, maximum audio duration, queue capacity, and logging verbosity. It SHALL NOT support engine, quantization, translation, local model path, or automatic-download policy fields.
 
 #### Scenario: Complete valid configuration is loaded
 - **WHEN** a configuration file supplies valid supported fields
-- **THEN** the daemon applies those values before model acquisition and serving transcription
+- **THEN** the daemon applies them before registry resolution and provider loading
 
-#### Scenario: Partial valid configuration is loaded
-- **WHEN** a configuration file omits optional fields
-- **THEN** documented defaults fill the omitted fields
+#### Scenario: Removed acquisition field is present
+- **WHEN** configuration supplies a local model path or automatic-download policy
+- **THEN** strict validation fails rather than changing registry behavior
 
 ### Requirement: Strict configuration validation
-A present configuration file SHALL fail validation for malformed YAML, unknown fields, inconsistent engine/model settings, unsupported quantization or accelerator values, invalid paths, and zero or out-of-range resource limits. The service SHALL NOT silently replace a present invalid configuration with defaults.
+A present configuration file SHALL fail validation for malformed YAML, unknown fields, unknown provider/model pairs, unsupported accelerator values, invalid cache paths, and zero or out-of-range resource limits. The service SHALL NOT silently replace invalid configuration with defaults.
 
-#### Scenario: Unknown configuration field is present
-- **WHEN** the YAML contains a field not recognized by the running Sophon version
-- **THEN** model state becomes `Failed` and `LastError` identifies the invalid field
+#### Scenario: Unknown provider/model pair is configured
+- **WHEN** configuration names a pair absent from the package registry
+- **THEN** STT state becomes terminal `Failed` and the error identifies the pair
 
 #### Scenario: YAML is malformed
 - **WHEN** the configuration file cannot be parsed
-- **THEN** model state becomes `Failed` and transcription calls return `ModelUnavailable`
+- **THEN** STT state becomes terminal `Failed` and transcription calls return `ModelUnavailable`
 
 ### Requirement: Startup-only configuration
 Configuration SHALL remain immutable for the daemon process lifetime, and changing the configuration file SHALL require restarting the service.
@@ -63,15 +63,15 @@ The default model cache SHALL be `sophon/models` beneath `$XDG_CACHE_HOME` when 
 - **THEN** automatic model acquisition and lookup use that directory
 
 ### Requirement: Independent TTS configuration
-The startup YAML configuration SHALL accept an optional strict TTS section containing provider and model identifiers, optional absolute local model path, optional cache override, automatic-download policy, default voice, default speed, optional PipeWire node name, playback volume, maximum text bytes, reference-audio bytes and duration, generated-output duration, and queue capacity.
+The startup YAML SHALL accept an optional strict TTS section containing provider/model identifiers, mode-applicable defaults, Qwen sampling, default speed, optional PipeWire node, playback volume, text and audio limits, generated duration, and queue capacity. It SHALL NOT accept model-path, cache override, or automatic-download fields.
 
 #### Scenario: Partial TTS configuration is loaded
-- **WHEN** the TTS section supplies only some supported fields
-- **THEN** documented TTS defaults fill omitted fields without changing STT configuration
+- **WHEN** the TTS section supplies only supported fields applicable to its selected model kind
+- **THEN** documented defaults fill omitted values without changing STT configuration
 
-#### Scenario: Complete TTS configuration is loaded
-- **WHEN** all TTS fields contain valid supported values
-- **THEN** Sophon applies them before TTS acquisition, provider loading, request acceptance, or playback
+#### Scenario: Removed TTS acquisition field is present
+- **WHEN** TTS configuration supplies a local model path, cache override, or download policy
+- **THEN** TTS configuration fails strictly without invalidating STT configuration
 
 ### Requirement: Documented TTS defaults
 When TTS configuration is omitted, Sophon SHALL select the pinned Kokoro int8 `tts-rs` provider model, automatic verified acquisition, voice `af_heart`, speed `1.0`, PipeWire's default sink, volume `1.0`, 16 KiB maximum text, 32 MiB and 60 seconds maximum reference audio, 600 seconds maximum generated output, and queue capacity 8.
@@ -102,34 +102,23 @@ TTS provider, model, defaults, limits, and playback settings SHALL remain immuta
 - **WHEN** the configuration file is modified after TTS initialization
 - **THEN** active synthesis and playback behavior remains unchanged until restart
 
-### Requirement: XDG TTS model cache
-The default TTS model cache SHALL be an independent entry beneath Sophon's XDG model cache, and a valid configured TTS cache directory SHALL override it.
-
-#### Scenario: TTS cache override is omitted
-- **WHEN** automatic Kokoro acquisition needs storage and no TTS cache override is configured
-- **THEN** Sophon stores the pinned TTS model beneath the XDG-derived Sophon model cache
-
-#### Scenario: TTS cache override is configured
-- **WHEN** a valid TTS cache directory is supplied
-- **THEN** TTS acquisition and validation use that directory without changing the STT cache location
-
 ### Requirement: Typed TTS provider configuration
-Sophon SHALL validate the TTS section into a provider/model-specific configuration variant with shared operational settings. Fields not valid for the selected Kokoro, Qwen Base, Qwen CustomVoice, or Qwen VoiceDesign variant SHALL fail TTS configuration without invalidating otherwise valid STT configuration.
+Sophon SHALL validate TTS configuration against the selected registry model kind. Base SHALL accept default clone reference path and optional transcript, CustomVoice SHALL accept a default named voice, and VoiceDesign SHALL accept a default prompt; inapplicable fields SHALL fail TTS configuration.
 
-#### Scenario: Qwen Base configuration is partial
-- **WHEN** provider `qwentts-cpp` selects a curated Base model and omits optional Qwen settings
-- **THEN** Sophon constructs a Base configuration using documented common and sampling defaults without requiring a named voice or description
+#### Scenario: Base defaults are omitted
+- **WHEN** a Base model omits clone defaults
+- **THEN** the provider uses its documented sane default behavior
 
 #### Scenario: CustomVoice default is omitted
-- **WHEN** provider `qwentts-cpp` selects a CustomVoice model without `default_voice`
-- **THEN** the typed variant uses documented default speaker `vivian` and validates that speaker after model loading
+- **WHEN** a CustomVoice model omits `default_voice`
+- **THEN** the provider uses documented default speaker `vivian` and validates it after loading
 
 #### Scenario: VoiceDesign default is omitted
-- **WHEN** provider `qwentts-cpp` selects a VoiceDesign model without `default_voice_description`
-- **THEN** the typed variant uses `A warm, clear, natural adult voice with moderate pitch and pace.`
+- **WHEN** a VoiceDesign model omits its default prompt
+- **THEN** the provider uses `A warm, clear, natural adult voice with moderate pitch and pace.`
 
 #### Scenario: Mode-inapplicable field is present
-- **WHEN** a Base configuration supplies `default_voice` or a Kokoro configuration supplies Qwen sampling settings
+- **WHEN** configuration supplies a default that is not valid for the selected registry kind
 - **THEN** TTS configuration fails and identifies the inapplicable field
 
 ### Requirement: Strict daemon-wide Qwen sampling configuration
@@ -157,3 +146,18 @@ Qwen configurations SHALL require effective speed `1.0`; SHALL validate default 
 #### Scenario: Oversized default description is configured
 - **WHEN** a VoiceDesign default exceeds `max_text_bytes`
 - **THEN** TTS configuration fails before acquisition
+
+### Requirement: Request precedence over TTS defaults
+Valid request-level clone audio and transcript, named voice, or voice-design prompt SHALL override the corresponding startup default for that synthesis only and SHALL NOT mutate daemon configuration.
+
+#### Scenario: Request overrides default voice
+- **WHEN** a CustomVoice request selects another available named voice
+- **THEN** that request uses the selected voice and later default requests use the configured voice
+
+#### Scenario: Request overrides default clone reference
+- **WHEN** a Base request supplies valid clone audio and optional transcript
+- **THEN** that request uses the supplied reference and later default requests retain configured Base defaults
+
+#### Scenario: Request overrides default prompt
+- **WHEN** a VoiceDesign request supplies a valid description
+- **THEN** that request uses the description and later default requests retain the configured prompt

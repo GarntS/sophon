@@ -35,4 +35,4 @@ pw-cli create-node adapter \
   '{ factory.name=support.null-audio-sink node.name=sophon.test.sink media.class=Audio/Sink object.linger=true audio.position=[ MONO ] }' \
   >/dev/null
 
-cargo test --lib playback::tests::pipewire_smoke_negotiates_and_drains -- --ignored --exact
+cargo test --lib tts::playback::tests::pipewire_smoke_negotiates_and_drains -- --ignored --exact

@@ -54,15 +54,11 @@ Sophon reads `$XDG_CONFIG_HOME/sophon/config.yaml` once at startup. Changes requ
 
 ```yaml
 # STT
-engine: parakeet # parakeet | canary
+provider: transcribe-rs
 model_id: parakeet-tdt-0.6b-v3-int8
-# model_path: /absolute/local/stt-model-directory
-quantization: int8 # int8 | fp16 | fp32
 accelerator: auto # auto | cpu | cuda | migraphx
 language: en
-translate: false
-# cache_dir: /absolute/stt-cache-directory
-automatic_download: true
+# cache_dir: /absolute/shared-model-cache
 max_audio_bytes: 33554432
 max_audio_seconds: 600
 queue_capacity: 8
@@ -72,9 +68,6 @@ log_level: info
 tts:
   provider: tts-rs
   model_id: kokoro-v1.0-int8
-  # model_path: /absolute/local/kokoro-directory
-  # cache_dir: /absolute/tts-cache-directory
-  automatic_download: true
   default_voice: af_heart
   default_speed: 1.0 # finite, 0.5 through 2.0
   # pipewire_node: alsa_output.example # exact stable node.name
@@ -86,7 +79,7 @@ tts:
   queue_capacity: 8
 ```
 
-Defaults cache STT beneath `$XDG_CACHE_HOME/sophon/models` and TTS beneath `$XDG_CACHE_HOME/sophon/models/tts`. A configured local model path is validated and never replaced by an automatic download. Registry downloads use pinned HTTPS release artifacts, exact byte-size and SHA-256 verification, per-digest locking, temporary streaming files, and atomic publication. Canonical files live at `artifacts/<sha256>/<filename>`; models sharing an artifact resolve the same verified file. Download progress is aggregate verified/downloaded bytes rather than completed-file count.
+STT and TTS share `$XDG_CACHE_HOME/sophon/models` unless the top-level `cache_dir` overrides it. The package's read-only `model_registry.yaml` is the only model catalog. Missing or invalid files are always downloaded from its pinned HTTPS URLs; local model paths, provider-specific caches, and download-policy switches are not supported. Artifacts live at `artifacts/<sha256>` and model views contain hard links, so models sharing bytes use one verified blob. Download progress is aggregate verified/downloaded bytes rather than completed-file count. A model's first resolution failure is terminal for that daemon process; restart Sophon to retry. Independently completed blobs remain reusable.
 
 The Kokoro int8 model is approximately 88 MiB and its voice archive approximately 27 MiB, for an initial download/cache footprint of roughly 115 MiB, excluding the generated optimized ONNX graph.
 
@@ -109,6 +102,8 @@ Qwen configuration is typed by the selected model. Fields belonging to another m
 tts:
   provider: qwentts-cpp
   model_id: qwen3-tts-0.6b-base-q8_0 # provider-only config also defaults here
+  # default_clone_reference: /absolute/reference-24khz-mono-f32.wav
+  # default_clone_transcript: Optional words spoken in the reference
   default_speed: 1.0
   sampling:
     # seed: 42 # omit for random seeds; configure for deterministic replay
@@ -135,7 +130,11 @@ tts:
   default_voice_description: A warm, clear, natural adult voice with moderate pitch and pace.
 ```
 
-The daemon-wide Qwen sampling policy cannot be overridden per request. Defaults are a random seed, 2048 new tokens, temperature 0.9, top-k 50, top-p 1.0, and repetition penalty 1.05. The effective token maximum is the lower of `max_new_tokens` and the native conversion of `max_generated_audio_seconds`. Configured numeric seeds are reused for deterministic requests.
+The daemon-wide Qwen sampling policy cannot be overridden per request. Defaults are a random seed, 2048 new tokens, temperature 0.9, top-k 50, top-p 1.0, and repetition penalty 1.05. The effective token maximum is the lower of `max_new_tokens` and the native conversion of `max_generated_audio_seconds`. Configured numeric seeds are reused for deterministic requests. Request-level clone audio/transcript, named voice, or voice description overrides the corresponding startup default for that request only.
+
+### Breaking configuration migration
+
+Replace STT `engine` with `provider: transcribe-rs`. Remove `quantization`, `translate`, every `model_path`, every `automatic_download`, and `tts.cache_dir`; these fields now fail strict parsing. Keep only the top-level shared `cache_dir`. Choose provider/model pairs present in the installed package registry. Existing content-addressed blobs can be reused, but old model-specific layouts are rebuilt as registry views.
 
 Omitted Qwen language selects automatic detection. Supported case-insensitive base and documented regional tags cover English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, and Italian; unsupported tags return `InvalidTtsOptions` instead of falling back to English.
 
@@ -162,6 +161,8 @@ Interface: `com.garntresearch.sophon`
 - `SpeakToBuffer(s text, a{sv} options) -> (h fd, t size_bytes)`
 - `SpeakAloud(s text, a{sv} options) -> ()`
 
+Transcription options recognize only `language` as a string. Translation is not supported; clients should use a separate translation service.
+
 `SpeakToFile` requires an absolute path that does not exist. Creation is exclusive, concurrent creation returns `OutputExists`, and a failed write removes only the partial file Sophon created.
 
 `SpeakToBuffer` returns a server-created memfd positioned at byte zero. Its complete WAV contents and size are immutable using Linux write, grow, shrink, and further-sealing seals. The transferred client descriptor remains readable after the server drops its reference.
@@ -187,7 +188,7 @@ Kokoro supports default and named voices. Qwen Base supports default synthesis a
 
 ### Lifecycle and capability discovery
 
-STT properties are `State`, `ActiveEngine`, `ActiveModel`, `DownloadProgress`, and `LastError`.
+STT properties are `State`, `ActiveProvider`, `ActiveModel`, `DownloadProgress`, and `LastError`.
 
 Independent TTS properties are:
 

@@ -6,14 +6,16 @@ use directories::BaseDirs;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::acquisition::{QwenTtsMode, lookup_tts};
+use crate::model_registry::{LoaderKind, ModelCatalog, package_registry_path};
 
+pub const DEFAULT_STT_PROVIDER: &str = "transcribe-rs";
 pub const DEFAULT_MODEL_ID: &str = "parakeet-tdt-0.6b-v3-int8";
 pub const DEFAULT_MAX_AUDIO_BYTES: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_AUDIO_SECONDS: u64 = 10 * 60;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 8;
 pub const DEFAULT_TTS_PROVIDER: &str = "tts-rs";
 pub const DEFAULT_TTS_MODEL_ID: &str = "kokoro-v1.0-int8";
+pub const DEFAULT_QWEN_BASE_MODEL_ID: &str = "qwen3-tts-0.6b-base-q8_0";
 pub const DEFAULT_TTS_VOICE: &str = "af_heart";
 pub const DEFAULT_QWEN_CUSTOM_VOICE: &str = "vivian";
 pub const DEFAULT_QWEN_VOICE_DESCRIPTION: &str =
@@ -145,10 +147,9 @@ impl Default for QwenSamplingConfig {
 struct TtsFileConfig {
     provider: String,
     model_id: Option<String>,
-    model_path: Option<PathBuf>,
-    cache_dir: Option<PathBuf>,
-    automatic_download: bool,
     default_voice: Option<String>,
+    default_clone_reference: Option<PathBuf>,
+    default_clone_transcript: Option<String>,
     default_voice_description: Option<String>,
     sampling: Option<QwenSamplingConfig>,
     default_speed: f64,
@@ -166,10 +167,9 @@ impl Default for TtsFileConfig {
         Self {
             provider: DEFAULT_TTS_PROVIDER.into(),
             model_id: None,
-            model_path: None,
-            cache_dir: None,
-            automatic_download: true,
             default_voice: None,
+            default_clone_reference: None,
+            default_clone_transcript: None,
             default_voice_description: None,
             sampling: None,
             default_speed: DEFAULT_TTS_SPEED,
@@ -186,9 +186,7 @@ impl Default for TtsFileConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TtsOperationalConfig {
-    pub model_path: Option<PathBuf>,
     pub cache_dir: PathBuf,
-    pub automatic_download: bool,
     pub default_speed: f64,
     pub pipewire_node: Option<String>,
     pub volume: f64,
@@ -207,6 +205,8 @@ pub enum TtsProviderConfig {
     },
     QwenBase {
         model_id: String,
+        default_clone_reference: Option<PathBuf>,
+        default_clone_transcript: Option<String>,
         sampling: QwenSamplingConfig,
     },
     QwenCustomVoice {
@@ -246,6 +246,17 @@ impl TtsConfig {
         }
     }
 
+    pub fn default_clone(&self) -> Option<(&PathBuf, Option<&str>)> {
+        match &self.provider {
+            TtsProviderConfig::QwenBase {
+                default_clone_reference: Some(path),
+                default_clone_transcript,
+                ..
+            } => Some((path, default_clone_transcript.as_deref())),
+            _ => None,
+        }
+    }
+
     pub fn default_voice(&self) -> Option<&str> {
         match &self.provider {
             TtsProviderConfig::Kokoro { default_voice, .. }
@@ -279,15 +290,11 @@ impl TtsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
-    engine: Engine,
+    provider: String,
     model_id: String,
-    model_path: Option<PathBuf>,
-    quantization: Quantization,
     accelerator: Accelerator,
     language: String,
-    translate: bool,
     cache_dir: Option<PathBuf>,
-    automatic_download: bool,
     max_audio_bytes: u64,
     max_audio_seconds: u64,
     queue_capacity: usize,
@@ -300,15 +307,11 @@ struct FileConfig {
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
-            engine: Engine::Parakeet,
+            provider: DEFAULT_STT_PROVIDER.into(),
             model_id: DEFAULT_MODEL_ID.into(),
-            model_path: None,
-            quantization: Quantization::Int8,
             accelerator: Accelerator::Auto,
             language: "en".into(),
-            translate: false,
             cache_dir: None,
-            automatic_download: true,
             max_audio_bytes: DEFAULT_MAX_AUDIO_BYTES,
             max_audio_seconds: DEFAULT_MAX_AUDIO_SECONDS,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
@@ -320,15 +323,11 @@ impl Default for FileConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    pub engine: Engine,
+    pub provider: String,
     pub model_id: String,
-    pub model_path: Option<PathBuf>,
-    pub quantization: Quantization,
     pub accelerator: Accelerator,
     pub language: String,
-    pub translate: bool,
     pub cache_dir: PathBuf,
-    pub automatic_download: bool,
     pub max_audio_bytes: u64,
     pub max_audio_seconds: u64,
     pub queue_capacity: usize,
@@ -340,6 +339,15 @@ impl Config {
     /// Loads configuration once at process startup. Callers retain this value;
     /// no file watching or reload path exists.
     pub fn load(paths: &ConfigPaths) -> Result<Self, ConfigError> {
+        let catalog = ModelCatalog::load(&package_registry_path())
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        Self::load_with_catalog(paths, &catalog)
+    }
+
+    pub fn load_with_catalog(
+        paths: &ConfigPaths,
+        catalog: &ModelCatalog,
+    ) -> Result<Self, ConfigError> {
         let file_config = match fs::read_to_string(&paths.config_file) {
             Ok(contents) => {
                 serde_yaml::from_str(&contents).map_err(|source| ConfigError::Parse {
@@ -355,32 +363,33 @@ impl Config {
                 });
             }
         };
-        Self::from_file(file_config, paths.model_cache.clone())
+        Self::from_file(file_config, paths.model_cache.clone(), catalog)
     }
 
-    fn from_file(file: FileConfig, default_cache: PathBuf) -> Result<Self, ConfigError> {
-        let tts = TtsConfig::from_value(file.tts, default_cache.join("tts"));
+    fn from_file(
+        file: FileConfig,
+        default_cache: PathBuf,
+        catalog: &ModelCatalog,
+    ) -> Result<Self, ConfigError> {
+        let cache_dir = file.cache_dir.unwrap_or(default_cache);
+        let tts = TtsConfig::from_value(file.tts, cache_dir.clone(), catalog);
         let config = Self {
-            engine: file.engine,
+            provider: file.provider,
             model_id: file.model_id,
-            model_path: file.model_path,
-            quantization: file.quantization,
             accelerator: file.accelerator,
             language: file.language,
-            translate: file.translate,
-            cache_dir: file.cache_dir.unwrap_or(default_cache),
-            automatic_download: file.automatic_download,
+            cache_dir,
             max_audio_bytes: file.max_audio_bytes,
             max_audio_seconds: file.max_audio_seconds,
             queue_capacity: file.queue_capacity,
             log_level: file.log_level,
             tts,
         };
-        config.validate()?;
+        config.validate(catalog)?;
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    fn validate(&self, catalog: &ModelCatalog) -> Result<(), ConfigError> {
         if self.model_id.trim().is_empty()
             || !self
                 .model_id
@@ -391,14 +400,28 @@ impl Config {
                 "model_id must be a non-empty identifier".into(),
             ));
         }
-        let engine_prefix = match self.engine {
-            Engine::Parakeet => "parakeet",
-            Engine::Canary => "canary",
-        };
-        if !self.model_id.starts_with(engine_prefix) {
+        if self.provider.trim().is_empty()
+            || !self
+                .provider
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(ConfigError::Invalid(
+                "provider must be a non-empty identifier".into(),
+            ));
+        }
+        let metadata = catalog
+            .model(&self.provider, &self.model_id)
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "unknown STT provider/model pair `{}/{}`",
+                    self.provider, self.model_id
+                ))
+            })?;
+        if !matches!(metadata.kind, LoaderKind::Parakeet | LoaderKind::Canary) {
             return Err(ConfigError::Invalid(format!(
-                "model_id `{}` is not valid for {engine_prefix}",
-                self.model_id
+                "registry kind `{:?}` is not supported for STT",
+                metadata.kind
             )));
         }
         if self.language.trim().is_empty()
@@ -410,6 +433,16 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "language must be a non-empty language tag".into(),
             ));
+        }
+        if !metadata
+            .languages
+            .iter()
+            .any(|language| language.as_str() == self.language)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "language `{}` is unsupported by `{}/{}`",
+                self.language, self.provider, self.model_id
+            )));
         }
         if self.max_audio_bytes == 0 || self.max_audio_bytes > MAX_AUDIO_BYTES {
             return Err(ConfigError::Invalid(format!(
@@ -425,13 +458,6 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "queue_capacity must be between 1 and {MAX_QUEUE_CAPACITY}"
             )));
-        }
-        if let Some(path) = &self.model_path
-            && (!path.is_absolute() || !path.is_dir())
-        {
-            return Err(ConfigError::Invalid(
-                "model_path must be an existing absolute directory".into(),
-            ));
         }
         if self.cache_dir.as_os_str().is_empty() {
             return Err(ConfigError::Invalid("cache_dir must not be empty".into()));
@@ -457,6 +483,7 @@ impl TtsConfig {
     fn from_value(
         value: Option<serde_yaml::Value>,
         default_cache: PathBuf,
+        catalog: &ModelCatalog,
     ) -> Result<Self, String> {
         let file = match value {
             Some(value) => serde_yaml::from_value::<TtsFileConfig>(value)
@@ -467,31 +494,37 @@ impl TtsConfig {
             .model_id
             .unwrap_or_else(|| match file.provider.as_str() {
                 DEFAULT_TTS_PROVIDER => DEFAULT_TTS_MODEL_ID.into(),
-                "qwentts-cpp" => crate::acquisition::QWEN_BASE_DEFAULT_MODEL_ID.into(),
+                "qwentts-cpp" => DEFAULT_QWEN_BASE_MODEL_ID.into(),
                 _ => String::new(),
             });
-        let definition = lookup_tts(&model_id).ok_or_else(|| {
-            format!(
-                "unsupported TTS provider/model combination `{}/{model_id}`",
-                file.provider
-            )
-        })?;
-        if definition.provider != file.provider {
-            return Err(format!(
-                "unsupported TTS provider/model combination `{}/{model_id}`",
-                file.provider
-            ));
-        }
-        match definition.qwen.map(|metadata| metadata.mode) {
-            None if file.default_voice_description.is_some() || file.sampling.is_some() => {
+        let kind = catalog
+            .model(&file.provider, &model_id)
+            .map(|metadata| metadata.kind)
+            .ok_or_else(|| {
+                format!(
+                    "unsupported TTS provider/model combination `{}/{model_id}`",
+                    file.provider
+                )
+            })?;
+        match kind {
+            LoaderKind::Kokoro
+                if file.default_voice_description.is_some()
+                    || file.default_clone_reference.is_some()
+                    || file.default_clone_transcript.is_some()
+                    || file.sampling.is_some() =>
+            {
                 let field = if file.default_voice_description.is_some() {
                     "default_voice_description"
+                } else if file.default_clone_reference.is_some() {
+                    "default_clone_reference"
+                } else if file.default_clone_transcript.is_some() {
+                    "default_clone_transcript"
                 } else {
                     "sampling"
                 };
                 return Err(format!("tts.{field} is not valid for Kokoro"));
             }
-            Some(QwenTtsMode::Base)
+            LoaderKind::Base
                 if file.default_voice.is_some() || file.default_voice_description.is_some() =>
             {
                 let field = if file.default_voice.is_some() {
@@ -501,35 +534,46 @@ impl TtsConfig {
                 };
                 return Err(format!("tts.{field} is not valid for Qwen Base"));
             }
-            Some(QwenTtsMode::CustomVoice) if file.default_voice_description.is_some() => {
-                return Err(
-                    "tts.default_voice_description is not valid for Qwen CustomVoice".into(),
-                );
+            LoaderKind::CustomVoice
+                if file.default_voice_description.is_some()
+                    || file.default_clone_reference.is_some()
+                    || file.default_clone_transcript.is_some() =>
+            {
+                return Err("clone/design defaults are not valid for Qwen CustomVoice".into());
             }
-            Some(QwenTtsMode::VoiceDesign) if file.default_voice.is_some() => {
-                return Err("tts.default_voice is not valid for Qwen VoiceDesign".into());
+            LoaderKind::VoiceDesign
+                if file.default_voice.is_some()
+                    || file.default_clone_reference.is_some()
+                    || file.default_clone_transcript.is_some() =>
+            {
+                return Err("voice/clone defaults are not valid for Qwen VoiceDesign".into());
+            }
+            LoaderKind::Parakeet | LoaderKind::Canary => {
+                return Err(format!("registry kind `{kind:?}` is not supported for TTS"));
             }
             _ => {}
         }
-        let provider = match definition.qwen.map(|metadata| metadata.mode) {
-            None => TtsProviderConfig::Kokoro {
+        let provider = match kind {
+            LoaderKind::Kokoro => TtsProviderConfig::Kokoro {
                 model_id,
                 default_voice: file
                     .default_voice
                     .unwrap_or_else(|| DEFAULT_TTS_VOICE.into()),
             },
-            Some(QwenTtsMode::Base) => TtsProviderConfig::QwenBase {
+            LoaderKind::Base => TtsProviderConfig::QwenBase {
                 model_id,
+                default_clone_reference: file.default_clone_reference,
+                default_clone_transcript: file.default_clone_transcript,
                 sampling: file.sampling.unwrap_or_default(),
             },
-            Some(QwenTtsMode::CustomVoice) => TtsProviderConfig::QwenCustomVoice {
+            LoaderKind::CustomVoice => TtsProviderConfig::QwenCustomVoice {
                 model_id,
                 default_voice: file
                     .default_voice
                     .unwrap_or_else(|| DEFAULT_QWEN_CUSTOM_VOICE.into()),
                 sampling: file.sampling.unwrap_or_default(),
             },
-            Some(QwenTtsMode::VoiceDesign) => TtsProviderConfig::QwenVoiceDesign {
+            LoaderKind::VoiceDesign => TtsProviderConfig::QwenVoiceDesign {
                 model_id,
                 default_voice_description: file
                     .default_voice_description
@@ -538,12 +582,11 @@ impl TtsConfig {
                     .to_owned(),
                 sampling: file.sampling.unwrap_or_default(),
             },
+            LoaderKind::Parakeet | LoaderKind::Canary => unreachable!(),
         };
         let config = Self {
             operational: TtsOperationalConfig {
-                model_path: file.model_path,
-                cache_dir: file.cache_dir.unwrap_or(default_cache),
-                automatic_download: file.automatic_download,
+                cache_dir: default_cache,
                 default_speed: file.default_speed,
                 pipewire_node: file.pipewire_node,
                 volume: file.volume,
@@ -561,15 +604,43 @@ impl TtsConfig {
 
     fn validate(&self) -> Result<(), String> {
         let operational = &self.operational;
-        if let Some(path) = &operational.model_path
-            && (!path.is_absolute() || !path.is_dir())
-        {
-            return Err("tts.model_path must be an existing absolute directory".into());
-        }
         if !operational.cache_dir.is_absolute()
             || (operational.cache_dir.exists() && !operational.cache_dir.is_dir())
         {
-            return Err("tts.cache_dir must be an absolute directory path".into());
+            return Err("cache_dir must be an absolute directory path".into());
+        }
+        if let TtsProviderConfig::QwenBase {
+            default_clone_reference,
+            default_clone_transcript,
+            ..
+        } = &self.provider
+        {
+            if default_clone_transcript.is_some() && default_clone_reference.is_none() {
+                return Err("tts.default_clone_transcript requires default_clone_reference".into());
+            }
+            if let Some(path) = default_clone_reference
+                && (!path.is_absolute() || !path.is_file())
+            {
+                return Err("tts.default_clone_reference must be an existing absolute file".into());
+            }
+            if let Some(transcript) = default_clone_transcript {
+                if transcript.trim().is_empty()
+                    || transcript.len() as u64 > operational.max_text_bytes
+                {
+                    return Err(
+                        "tts.default_clone_transcript must be nonempty and within max_text_bytes"
+                            .into(),
+                    );
+                }
+                if transcript.chars().any(|character| {
+                    character == '\0' || (character.is_control() && !character.is_whitespace())
+                }) {
+                    return Err(
+                        "tts.default_clone_transcript contains a disallowed control character"
+                            .into(),
+                    );
+                }
+            }
         }
         if let Some(default_voice) = self.default_voice()
             && (default_voice.trim().is_empty()
@@ -686,368 +757,157 @@ impl TtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-    use tempfile::tempdir;
 
-    fn paths(root: &Path) -> ConfigPaths {
-        ConfigPaths::from_homes(root.join("config"), root.join("cache"))
+    fn catalog() -> ModelCatalog {
+        ModelCatalog::from_yaml(include_str!("../model_registry.yaml")).unwrap()
+    }
+
+    fn fixture(contents: Option<&str>) -> (tempfile::TempDir, ConfigPaths) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_homes(root.path().join("config"), root.path().join("cache"));
+        if let Some(contents) = contents {
+            fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+            fs::write(&paths.config_file, contents).unwrap();
+        }
+        (root, paths)
     }
 
     #[test]
-    fn uses_documented_defaults_when_file_is_absent() {
-        let temp = tempdir().unwrap();
-        let config = Config::load(&paths(temp.path())).unwrap();
+    fn defaults_select_registered_pairs_and_one_shared_cache() {
+        let (_root, paths) = fixture(None);
+        let config = Config::load_with_catalog(&paths, &catalog()).unwrap();
+        assert_eq!(config.provider, DEFAULT_STT_PROVIDER);
         assert_eq!(config.model_id, DEFAULT_MODEL_ID);
-        assert_eq!(config.max_audio_bytes, DEFAULT_MAX_AUDIO_BYTES);
-        assert_eq!(config.max_audio_seconds, DEFAULT_MAX_AUDIO_SECONDS);
-        assert_eq!(config.queue_capacity, DEFAULT_QUEUE_CAPACITY);
+        assert_eq!(config.cache_dir, paths.model_cache);
         let tts = config.tts.unwrap();
-        assert!(matches!(&tts.provider, TtsProviderConfig::Kokoro { .. }));
         assert_eq!(tts.provider_id(), DEFAULT_TTS_PROVIDER);
         assert_eq!(tts.model_id(), DEFAULT_TTS_MODEL_ID);
-        assert_eq!(tts.default_voice(), Some(DEFAULT_TTS_VOICE));
-        assert_eq!(tts.operational.default_speed, DEFAULT_TTS_SPEED);
-        assert_eq!(tts.operational.pipewire_node, None);
-        assert_eq!(tts.operational.volume, DEFAULT_TTS_VOLUME);
-        assert_eq!(tts.operational.max_text_bytes, DEFAULT_MAX_TEXT_BYTES);
-        assert_eq!(
-            tts.operational.max_reference_audio_bytes,
-            DEFAULT_MAX_REFERENCE_AUDIO_BYTES
-        );
-        assert_eq!(
-            tts.operational.max_reference_audio_seconds,
-            DEFAULT_MAX_REFERENCE_AUDIO_SECONDS
-        );
-        assert_eq!(
-            tts.operational.max_generated_audio_seconds,
-            DEFAULT_MAX_GENERATED_AUDIO_SECONDS
-        );
-        assert_eq!(tts.operational.queue_capacity, DEFAULT_TTS_QUEUE_CAPACITY);
-        assert_eq!(
-            tts.operational.cache_dir,
-            paths(temp.path()).model_cache.join("tts")
-        );
+        assert_eq!(tts.operational.cache_dir, config.cache_dir);
     }
 
     #[test]
-    fn loads_complete_configuration() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        let model_path = temp.path().join("model");
-        fs::create_dir(&model_path).unwrap();
-        fs::write(&paths.config_file, format!(
-            "engine: parakeet\nmodel_id: parakeet-custom\nmodel_path: {}\nquantization: fp16\naccelerator: cpu\nlanguage: de\ntranslate: true\ncache_dir: {}\nautomatic_download: false\nmax_audio_bytes: 1024\nmax_audio_seconds: 30\nqueue_capacity: 2\nlog_level: debug\n",
-            model_path.display(), temp.path().join("cache-override").display()
-        )).unwrap();
-        let config = Config::load(&paths).unwrap();
+    fn supported_provider_model_and_limits_load() {
+        let (_root, paths) = fixture(Some(
+            "provider: transcribe-rs\nmodel_id: canary-180m-flash-en-es-de-fr-int8\naccelerator: cpu\nlanguage: de\ncache_dir: /tmp/sophon-models\nmax_audio_bytes: 1024\nmax_audio_seconds: 30\nqueue_capacity: 2\nlog_level: debug\n",
+        ));
+        let config = Config::load_with_catalog(&paths, &catalog()).unwrap();
         assert_eq!(config.language, "de");
-        assert!(!config.automatic_download);
+        assert_eq!(config.cache_dir, PathBuf::from("/tmp/sophon-models"));
         assert_eq!(config.queue_capacity, 2);
     }
 
     #[test]
-    fn merges_partial_configuration_and_rejects_unknown_fields() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        fs::write(&paths.config_file, "language: fr\n").unwrap();
-        assert_eq!(Config::load(&paths).unwrap().language, "fr");
-        fs::write(&paths.config_file, "unknown: true\n").unwrap();
-        assert!(matches!(
-            Config::load(&paths),
-            Err(ConfigError::Parse { .. })
-        ));
-        fs::write(&paths.config_file, "engine: [\n").unwrap();
-        assert!(matches!(
-            Config::load(&paths),
-            Err(ConfigError::Parse { .. })
-        ));
-    }
-
-    #[test]
-    fn loads_partial_and_complete_tts_configuration() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-
-        fs::write(&paths.config_file, "tts:\n  default_voice: bf_emma\n").unwrap();
-        let partial = Config::load(&paths).unwrap().tts.unwrap();
-        assert_eq!(partial.default_voice(), Some("bf_emma"));
-        assert_eq!(partial.operational.default_speed, DEFAULT_TTS_SPEED);
-        assert_eq!(partial.operational.max_text_bytes, DEFAULT_MAX_TEXT_BYTES);
-
-        let model_path = temp.path().join("kokoro");
-        fs::create_dir(&model_path).unwrap();
-        let cache_path = temp.path().join("tts-cache");
-        fs::write(
-            &paths.config_file,
-            format!(
-                "tts:\n  provider: tts-rs\n  model_id: kokoro-v1.0-int8\n  model_path: {}\n  cache_dir: {}\n  automatic_download: false\n  default_voice: am_adam\n  default_speed: 1.25\n  pipewire_node: alsa_output.fixture\n  volume: 0.5\n  max_text_bytes: 4096\n  max_reference_audio_bytes: 1048576\n  max_reference_audio_seconds: 20\n  max_generated_audio_seconds: 120\n  queue_capacity: 3\n",
-                model_path.display(),
-                cache_path.display()
-            ),
-        )
-        .unwrap();
-        let complete = Config::load(&paths).unwrap().tts.unwrap();
-        assert_eq!(
-            complete.operational.model_path.as_deref(),
-            Some(model_path.as_path())
-        );
-        assert_eq!(complete.operational.cache_dir, cache_path);
-        assert!(!complete.operational.automatic_download);
-        assert_eq!(complete.operational.default_speed, 1.25);
-        assert_eq!(
-            complete.operational.pipewire_node.as_deref(),
-            Some("alsa_output.fixture")
-        );
-        assert_eq!(complete.operational.volume, 0.5);
-        assert_eq!(complete.operational.queue_capacity, 3);
-    }
-
-    #[test]
-    fn decodes_tts_into_strict_provider_model_variants() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        let cases = [
-            ("qwen3-tts-0.6b-base-q8_0", QwenTtsMode::Base),
-            ("qwen3-tts-1.7b-base-q8_0", QwenTtsMode::Base),
-            ("qwen3-tts-0.6b-custom-voice-q8_0", QwenTtsMode::CustomVoice),
-            ("qwen3-tts-1.7b-custom-voice-q8_0", QwenTtsMode::CustomVoice),
-            ("qwen3-tts-1.7b-voice-design-q8_0", QwenTtsMode::VoiceDesign),
-        ];
-        for (model_id, expected_mode) in cases {
-            fs::write(
-                &paths.config_file,
-                format!("tts:\n  provider: qwentts-cpp\n  model_id: {model_id}\n"),
-            )
-            .unwrap();
-            let tts = Config::load(&paths).unwrap().tts.unwrap();
-            let mode = match &tts.provider {
-                TtsProviderConfig::QwenBase { .. } => QwenTtsMode::Base,
-                TtsProviderConfig::QwenCustomVoice { .. } => QwenTtsMode::CustomVoice,
-                TtsProviderConfig::QwenVoiceDesign { .. } => QwenTtsMode::VoiceDesign,
-                TtsProviderConfig::Kokoro { .. } => panic!("expected Qwen variant"),
-            };
-            assert_eq!(mode, expected_mode);
-            assert_eq!(tts.model_id(), model_id);
-        }
-    }
-
-    #[test]
-    fn qwen_mode_specific_defaults_are_applied_only_to_matching_models() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-
-        fs::write(
-            &paths.config_file,
-            "tts:\n  provider: qwentts-cpp\n  model_id: qwen3-tts-0.6b-custom-voice-q8_0\n",
-        )
-        .unwrap();
-        let custom = Config::load(&paths).unwrap().tts.unwrap();
-        assert_eq!(custom.default_voice(), Some(DEFAULT_QWEN_CUSTOM_VOICE));
-        assert_eq!(custom.default_voice_description(), None);
-
-        fs::write(
-            &paths.config_file,
-            "tts:\n  provider: qwentts-cpp\n  model_id: qwen3-tts-1.7b-voice-design-q8_0\n",
-        )
-        .unwrap();
-        let design = Config::load(&paths).unwrap().tts.unwrap();
-        assert_eq!(design.default_voice(), None);
-        assert_eq!(
-            design.default_voice_description(),
-            Some(DEFAULT_QWEN_VOICE_DESCRIPTION)
-        );
-    }
-
-    #[test]
-    fn qwen_sampling_is_strict_daemon_wide_configuration_with_sane_defaults() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        fs::write(&paths.config_file, "tts:\n  provider: qwentts-cpp\n").unwrap();
-        let defaults = Config::load(&paths).unwrap().tts.unwrap();
-        assert_eq!(
-            defaults.model_id(),
-            crate::acquisition::QWEN_BASE_DEFAULT_MODEL_ID
-        );
-        assert_eq!(defaults.sampling(), Some(&QwenSamplingConfig::default()));
-
-        fs::write(
-            &paths.config_file,
-            "tts:\n  provider: qwentts-cpp\n  sampling:\n    seed: 42\n    max_new_tokens: 1024\n    temperature: 0.7\n    top_k: 25\n    top_p: 0.8\n    repetition_penalty: 1.1\n",
-        )
-        .unwrap();
-        assert_eq!(
-            Config::load(&paths).unwrap().tts.unwrap().sampling(),
-            Some(&QwenSamplingConfig {
-                seed: Some(42),
-                max_new_tokens: 1024,
-                temperature: 0.7,
-                top_k: 25,
-                top_p: 0.8,
-                repetition_penalty: 1.1,
-            })
-        );
-
-        fs::write(
-            &paths.config_file,
-            "tts:\n  provider: qwentts-cpp\n  sampling:\n    unknown: true\n",
-        )
-        .unwrap();
-        assert!(Config::load(&paths).unwrap().tts.is_err());
-    }
-
-    #[test]
-    fn validates_qwen_sampling_speed_and_default_description_limits() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        let invalid = [
-            "model_id: qwen3-tts-0.6b-base-q8_0\n  default_speed: 1.1",
-            "model_id: qwen3-tts-0.6b-base-q8_0\n  sampling:\n    seed: 9223372036854775808",
-            "model_id: qwen3-tts-0.6b-base-q8_0\n  sampling:\n    max_new_tokens: 0",
-            "model_id: qwen3-tts-0.6b-base-q8_0\n  sampling:\n    temperature: .nan",
-            "model_id: qwen3-tts-0.6b-base-q8_0\n  sampling:\n    top_k: 0",
-            "model_id: qwen3-tts-0.6b-base-q8_0\n  sampling:\n    top_p: 0.0",
-            "model_id: qwen3-tts-0.6b-base-q8_0\n  sampling:\n    repetition_penalty: 2.1",
-            "model_id: qwen3-tts-1.7b-voice-design-q8_0\n  default_voice_description: '   '",
-            "model_id: qwen3-tts-1.7b-voice-design-q8_0\n  max_text_bytes: 4\n  default_voice_description: hello",
-            "model_id: qwen3-tts-1.7b-voice-design-q8_0\n  default_voice_description: \"bad\\u0001voice\"",
-        ];
-        for mapping in invalid {
-            fs::write(
-                &paths.config_file,
-                format!("tts:\n  provider: qwentts-cpp\n  {mapping}\n"),
-            )
-            .unwrap();
-            assert!(
-                Config::load(&paths).unwrap().tts.is_err(),
-                "mapping should fail: {mapping}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_fields_inapplicable_to_the_selected_tts_variant() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        let invalid = [
-            "provider: tts-rs\n  model_id: kokoro-v1.0-int8\n  default_voice_description: warm",
-            "provider: qwentts-cpp\n  model_id: qwen3-tts-0.6b-base-q8_0\n  default_voice: vivian",
-            "provider: qwentts-cpp\n  model_id: qwen3-tts-0.6b-base-q8_0\n  default_voice_description: warm",
-            "provider: qwentts-cpp\n  model_id: qwen3-tts-0.6b-custom-voice-q8_0\n  default_voice_description: warm",
-            "provider: qwentts-cpp\n  model_id: qwen3-tts-1.7b-voice-design-q8_0\n  default_voice: vivian",
-            "provider: tts-rs\n  model_id: qwen3-tts-0.6b-base-q8_0",
-        ];
-        for mapping in invalid {
-            fs::write(&paths.config_file, format!("tts:\n  {mapping}\n")).unwrap();
-            let tts = Config::load(&paths).unwrap().tts;
-            assert!(tts.is_err(), "mapping should fail: {mapping}");
-        }
-    }
-
-    #[test]
-    fn localizes_unknown_and_malformed_tts_fields_to_tts() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-
-        for tts in [
-            "tts:\n  unknown: true\n",
-            "tts:\n  volume: loud\n",
-            "tts:\n  queue_capacity: []\n",
+    fn removed_stt_and_tts_acquisition_fields_are_rejected() {
+        for field in [
+            "engine: parakeet",
+            "quantization: int8",
+            "translate: false",
+            "model_path: /tmp/model",
+            "automatic_download: true",
         ] {
-            fs::write(&paths.config_file, format!("language: fr\n{tts}")).unwrap();
-            let config = Config::load(&paths).unwrap();
-            assert_eq!(config.language, "fr");
-            assert!(config.tts.is_err());
+            let (_root, paths) = fixture(Some(field));
+            assert!(matches!(
+                Config::load_with_catalog(&paths, &catalog()),
+                Err(ConfigError::Parse { .. })
+            ));
+        }
+        for field in [
+            "model_path: /tmp/model",
+            "cache_dir: /tmp/tts",
+            "automatic_download: true",
+        ] {
+            let yaml = format!("tts:\n  {field}\n");
+            let (_root, paths) = fixture(Some(&yaml));
+            let config = Config::load_with_catalog(&paths, &catalog()).unwrap();
+            assert!(config.tts.unwrap_err().contains("unknown field"));
         }
     }
 
     #[test]
-    fn rejects_invalid_tts_combinations_paths_strings_ranges_and_limits() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-
-        let invalid_mappings = [
-            "model_id: kokoro-unknown",
-            "model_path: relative/model",
-            "cache_dir: relative/cache",
-            "default_voice: ''",
-            "default_voice: 'bad voice'",
-            "default_speed: .nan",
-            "default_speed: 0.1",
-            "pipewire_node: ''",
-            "volume: .inf",
-            "volume: 1.1",
-            "max_text_bytes: 0",
-            "max_reference_audio_bytes: 0",
-            "max_reference_audio_seconds: 0",
-            "max_generated_audio_seconds: 0",
-            "queue_capacity: 0",
-            "queue_capacity: 129",
-        ];
-        for mapping in invalid_mappings {
-            fs::write(
-                &paths.config_file,
-                format!("language: de\ntts:\n  {mapping}\n"),
-            )
-            .unwrap();
-            let config = Config::load(&paths).unwrap();
-            assert_eq!(config.language, "de", "mapping: {mapping}");
-            assert!(config.tts.is_err(), "mapping should fail: {mapping}");
+    fn unknown_stt_pair_or_language_fails_strictly() {
+        for yaml in [
+            "provider: transcribe-rs\nmodel_id: missing\n",
+            "provider: transcribe-rs\nmodel_id: parakeet-tdt-0.6b-v3-int8\nlanguage: ja\n",
+            "provider: qwentts-cpp\nmodel_id: qwen3-tts-0.6b-base-q8_0\n",
+        ] {
+            let (_root, paths) = fixture(Some(yaml));
+            assert!(matches!(
+                Config::load_with_catalog(&paths, &catalog()),
+                Err(ConfigError::Invalid(_))
+            ));
         }
     }
 
     #[test]
-    fn rejects_inconsistent_and_out_of_range_values() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        fs::write(
-            &paths.config_file,
-            "engine: canary\nmodel_id: parakeet-tdt-0.6b-v3-int8\n",
-        )
-        .unwrap();
-        assert!(matches!(Config::load(&paths), Err(ConfigError::Invalid(_))));
-        fs::write(&paths.config_file, "max_audio_bytes: 0\n").unwrap();
-        assert!(matches!(Config::load(&paths), Err(ConfigError::Invalid(_))));
-    }
+    fn invalid_tts_is_isolated_from_valid_stt() {
+        let (_root, paths) = fixture(Some("tts:\n  provider: qwentts-cpp\n  model_id: missing\n"));
+        let config = Config::load_with_catalog(&paths, &catalog()).unwrap();
+        assert_eq!(config.model_id, DEFAULT_MODEL_ID);
+        assert!(config.tts.is_err());
 
-    #[test]
-    fn migraphx_is_accepted_only_when_compiled_in() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        fs::write(&paths.config_file, "accelerator: migraphx\n").unwrap();
-
-        let result = Config::load(&paths);
-        if cfg!(feature = "migraphx") {
-            assert_eq!(result.unwrap().accelerator, Accelerator::Migraphx);
-        } else {
-            assert!(
-                matches!(result, Err(ConfigError::Invalid(message)) if message.contains("MIGraphX"))
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_obsolete_rocm_accelerator_without_an_alias() {
-        let temp = tempdir().unwrap();
-        let paths = paths(temp.path());
-        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
-        fs::write(&paths.config_file, "accelerator: rocm\n").unwrap();
-
-        assert!(matches!(
-            Config::load(&paths),
-            Err(ConfigError::Parse { source, .. })
-                if source.to_string().contains("unknown variant `rocm`")
+        let (_root, paths) = fixture(Some(
+            "tts:\n  provider: transcribe-rs\n  model_id: parakeet-tdt-0.6b-v3-int8\n",
         ));
+        assert!(
+            Config::load_with_catalog(&paths, &catalog())
+                .unwrap()
+                .tts
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn qwen_modes_apply_sane_defaults_and_reject_inapplicable_fields() {
+        let cases = [
+            ("qwen3-tts-0.6b-base-q8_0", LoaderKind::Base),
+            ("qwen3-tts-0.6b-custom-voice-q8_0", LoaderKind::CustomVoice),
+            ("qwen3-tts-1.7b-voice-design-q8_0", LoaderKind::VoiceDesign),
+        ];
+        for (model, kind) in cases {
+            let yaml = format!("tts:\n  provider: qwentts-cpp\n  model_id: {model}\n");
+            let (_root, paths) = fixture(Some(&yaml));
+            let tts = Config::load_with_catalog(&paths, &catalog())
+                .unwrap()
+                .tts
+                .unwrap();
+            match kind {
+                LoaderKind::Base => assert!(tts.default_clone().is_none()),
+                LoaderKind::CustomVoice => {
+                    assert_eq!(tts.default_voice(), Some(DEFAULT_QWEN_CUSTOM_VOICE))
+                }
+                LoaderKind::VoiceDesign => assert_eq!(
+                    tts.default_voice_description(),
+                    Some(DEFAULT_QWEN_VOICE_DESCRIPTION)
+                ),
+                _ => unreachable!(),
+            }
+        }
+        let (_root, paths) = fixture(Some(
+            "tts:\n  provider: qwentts-cpp\n  model_id: qwen3-tts-0.6b-custom-voice-q8_0\n  default_voice_description: warm\n",
+        ));
+        assert!(
+            Config::load_with_catalog(&paths, &catalog())
+                .unwrap()
+                .tts
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn base_clone_defaults_are_startup_validated() {
+        let root = tempfile::tempdir().unwrap();
+        let reference = root.path().join("reference.wav");
+        fs::write(&reference, b"fixture").unwrap();
+        let paths = ConfigPaths::from_homes(root.path().join("config"), root.path().join("cache"));
+        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+        fs::write(&paths.config_file, format!(
+            "tts:\n  provider: qwentts-cpp\n  model_id: qwen3-tts-0.6b-base-q8_0\n  default_clone_reference: {}\n  default_clone_transcript: hello\n",
+            reference.display(),
+        )).unwrap();
+        let config = Config::load_with_catalog(&paths, &catalog()).unwrap();
+        let tts = config.tts.unwrap();
+        let (path, transcript) = tts.default_clone().unwrap();
+        assert_eq!(path, &reference);
+        assert_eq!(transcript, Some("hello"));
     }
 }

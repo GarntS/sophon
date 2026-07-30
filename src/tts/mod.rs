@@ -1,5 +1,12 @@
 //! Provider-neutral text-to-speech engine contract and scheduling.
 
+pub mod playback;
+pub mod service;
+pub mod types;
+
+pub use service::TtsService;
+pub use types::{TtsCapabilities, TtsRequest, VoiceIntent};
+
 use std::{
     path::{Path, PathBuf},
     sync::mpsc::{SyncSender, TrySendError, sync_channel},
@@ -14,9 +21,10 @@ use tts_rs::{
 };
 
 use crate::{
-    acquisition::{QwenTtsMode, ResolvedQwenModel},
+    audio::OwnedAudio,
     config::{QwenSamplingConfig, TtsConfig, TtsProviderConfig},
-    domain::{OwnedAudio, SophonError, TtsCapabilities, TtsRequest, VoiceIntent},
+    error::SophonError,
+    model_registry::LoaderKind,
 };
 #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
 use qwentts_cpp::{
@@ -160,13 +168,14 @@ pub struct QwenEngineAdapter {
 #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
 impl QwenEngineAdapter {
     pub fn load(
-        model: &ResolvedQwenModel,
+        talker_path: &Path,
+        codec_path: &Path,
         sampling: &QwenSamplingConfig,
         max_generated_audio_seconds: u64,
     ) -> Result<Self, SophonError> {
         let mut engine = QwenTtsEngine::new();
         engine
-            .load_model(&model.talker_path, &model.codec_path)
+            .load_model(talker_path, codec_path)
             .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
         let duration_tokens = engine
             .duration_sec_to_tokens(max_generated_audio_seconds as f32)
@@ -578,7 +587,12 @@ impl TtsProvider for QwenTtsBaseProvider {
 
 pub enum TtsProviderModel {
     KokoroDirectory(PathBuf),
-    Qwen(ResolvedQwenModel),
+    Qwen {
+        model_id: String,
+        kind: LoaderKind,
+        talker_path: PathBuf,
+        codec_path: PathBuf,
+    },
 }
 
 pub fn create_tts_provider(
@@ -599,33 +613,41 @@ pub fn create_tts_provider(
             default_voice,
             optimized_model_cache_path,
         )?)),
-        (variant, TtsProviderModel::Qwen(model)) => {
-            let (model_id, expected_mode, sampling) = match variant {
-                TtsProviderConfig::QwenBase { model_id, sampling } => {
-                    (model_id, QwenTtsMode::Base, sampling)
-                }
+        (
+            variant,
+            TtsProviderModel::Qwen {
+                model_id: resolved_id,
+                kind,
+                talker_path,
+                codec_path,
+            },
+        ) => {
+            let (model_id, expected_kind, sampling) = match variant {
+                TtsProviderConfig::QwenBase {
+                    model_id, sampling, ..
+                } => (model_id, LoaderKind::Base, sampling),
                 TtsProviderConfig::QwenCustomVoice {
                     model_id, sampling, ..
-                } => (model_id, QwenTtsMode::CustomVoice, sampling),
+                } => (model_id, LoaderKind::CustomVoice, sampling),
                 TtsProviderConfig::QwenVoiceDesign {
                     model_id, sampling, ..
-                } => (model_id, QwenTtsMode::VoiceDesign, sampling),
+                } => (model_id, LoaderKind::VoiceDesign, sampling),
                 TtsProviderConfig::Kokoro { .. } => {
                     return Err(SophonError::ModelUnavailable(
                         "Kokoro configuration cannot load Qwen artifacts".into(),
                     ));
                 }
             };
-            if model.definition.id != model_id || model.metadata.mode != expected_mode {
+            if resolved_id != *model_id || kind != expected_kind {
                 return Err(SophonError::ModelUnavailable(format!(
-                    "typed TTS configuration does not match resolved model `{}`",
-                    model.definition.id
+                    "typed TTS configuration does not match resolved model `{resolved_id}`"
                 )));
             }
             #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
             {
                 let engine = QwenEngineAdapter::load(
-                    &model,
+                    &talker_path,
+                    &codec_path,
                     sampling,
                     config.operational.max_generated_audio_seconds,
                 )?;
@@ -658,7 +680,7 @@ pub fn create_tts_provider(
             }
             #[cfg(not(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan")))]
             {
-                let _ = sampling;
+                let _ = (sampling, talker_path, codec_path);
                 Err(SophonError::ModelUnavailable(
                     "this Sophon build has no Qwen backend".into(),
                 ))
@@ -1271,20 +1293,22 @@ mod tests {
             root.path().join("cache"),
         );
         let mut config = crate::config::Config::load(&paths).unwrap().tts.unwrap();
-        let definition = &crate::acquisition::QWEN_06B_BASE;
-        let resolved = ResolvedQwenModel {
-            definition,
-            metadata: definition.qwen.unwrap(),
+        let model_id = "qwen3-tts-0.6b-base-q8_0";
+        let resolved = TtsProviderModel::Qwen {
+            model_id: model_id.into(),
+            kind: LoaderKind::Base,
             talker_path: root.path().join("talker.gguf"),
             codec_path: root.path().join("codec.gguf"),
         };
         assert!(matches!(
-            create_tts_provider(&config, TtsProviderModel::Qwen(resolved), None),
+            create_tts_provider(&config, resolved, None),
             Err(SophonError::ModelUnavailable(_))
         ));
 
         config.provider = TtsProviderConfig::QwenBase {
-            model_id: definition.id.into(),
+            model_id: model_id.into(),
+            default_clone_reference: None,
+            default_clone_transcript: None,
             sampling: QwenSamplingConfig::default(),
         };
         assert!(matches!(

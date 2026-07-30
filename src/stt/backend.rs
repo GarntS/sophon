@@ -9,9 +9,9 @@ use transcribe_rs::{
 };
 
 use crate::{
-    acquisition::ModelCapabilities,
     config::{Accelerator, Engine, Quantization},
-    domain::{SophonError, TranscriptionOptions},
+    error::SophonError,
+    stt::TranscriptionOptions,
 };
 
 fn quantization(value: Quantization) -> OrtQuantization {
@@ -46,31 +46,25 @@ pub fn configure_accelerator(value: Accelerator) -> Result<(), SophonError> {
 pub fn to_transcribe_options(
     options: &TranscriptionOptions,
     defaults: &TranscriptionOptions,
-    capabilities: &ModelCapabilities,
+    supported_languages: &[String],
 ) -> Result<transcribe_rs::TranscribeOptions, SophonError> {
     let language = options
         .language
         .clone()
         .or_else(|| defaults.language.clone());
     if let Some(language) = &language
-        && !capabilities.languages.is_empty()
-        && !capabilities.languages.contains(&language.as_str())
+        && !supported_languages.is_empty()
+        && !supported_languages
+            .iter()
+            .any(|supported| supported == language)
     {
         return Err(SophonError::InvalidOptions(format!(
             "language `{language}` is unsupported by the active model"
         )));
     }
-    let translate = options
-        .translate
-        .unwrap_or(defaults.translate.unwrap_or(false));
-    if translate && !capabilities.translation_to_english {
-        return Err(SophonError::InvalidOptions(
-            "translation is unsupported by the active model".into(),
-        ));
-    }
     Ok(transcribe_rs::TranscribeOptions {
         language,
-        translate,
+        translate: false,
         ..Default::default()
     })
 }
@@ -135,7 +129,6 @@ pub fn create_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acquisition::{CANARY, PARAKEET};
     use std::sync::Mutex;
 
     struct RecordingFactory(Mutex<Vec<Engine>>);
@@ -164,27 +157,22 @@ mod tests {
     fn options_apply_defaults_and_reject_unsupported_requests() {
         let defaults = TranscriptionOptions {
             language: Some("en".into()),
-            translate: Some(false),
         };
+        let languages = vec!["en".into(), "de".into()];
         assert_eq!(
-            to_transcribe_options(
-                &TranscriptionOptions::default(),
-                &defaults,
-                &CANARY.capabilities
-            )
-            .unwrap()
-            .language
-            .as_deref(),
+            to_transcribe_options(&TranscriptionOptions::default(), &defaults, &languages)
+                .unwrap()
+                .language
+                .as_deref(),
             Some("en")
         );
         assert!(matches!(
             to_transcribe_options(
                 &TranscriptionOptions {
-                    language: Some("ja".into()),
-                    translate: None
+                    language: Some("ja".into())
                 },
                 &defaults,
-                &CANARY.capabilities
+                &languages
             ),
             Err(SophonError::InvalidOptions(_))
         ));
@@ -203,30 +191,6 @@ mod tests {
             *factory.0.lock().unwrap(),
             vec![Engine::Parakeet, Engine::Canary]
         );
-    }
-
-    #[test]
-    fn options_accept_canary_translation_and_reject_parakeet_translation() {
-        let requested = TranscriptionOptions {
-            language: Some("de".into()),
-            translate: Some(true),
-        };
-        assert!(
-            to_transcribe_options(
-                &requested,
-                &TranscriptionOptions::default(),
-                &CANARY.capabilities
-            )
-            .is_ok()
-        );
-        assert!(matches!(
-            to_transcribe_options(
-                &requested,
-                &TranscriptionOptions::default(),
-                &PARAKEET.capabilities
-            ),
-            Err(SophonError::InvalidOptions(_))
-        ));
     }
 
     #[test]

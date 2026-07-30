@@ -1,0 +1,128 @@
+providers:
+  transcribe-rs:
+    parakeet-tdt-0.6b-v3-int8:
+      kind: parakeet
+      revision: 8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce
+      languages: [en]
+      files:
+        encoder:
+          path: encoder-model.int8.onnx
+          url: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/encoder-model.int8.onnx
+          sha256: 6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09
+          size: 652183999
+        decoder_joint:
+          path: decoder_joint-model.int8.onnx
+          url: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/decoder_joint-model.int8.onnx
+          sha256: eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70
+          size: 18202004
+        nemo:
+          path: nemo128.onnx
+          url: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/nemo128.onnx
+          sha256: a9fde1486ebfcc08f328d75ad4610c67835fea58c73ba57e3209a6f6cf019e9f
+          size: 139764
+        vocabulary:
+          path: vocab.txt
+          url: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/vocab.txt
+          sha256: d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d
+          size: 93939
+    canary-180m-flash-en-es-de-fr-int8:
+      kind: canary
+      revision: 92c2231a4e2b2524277fea759be967d2e6edfc49
+      languages: [en, es, de, fr]
+      files:
+        encoder:
+          path: encoder-model.int8.onnx
+          url: https://huggingface.co/istupakov/canary-180m-flash-onnx/resolve/92c2231a4e2b2524277fea759be967d2e6edfc49/encoder-model.int8.onnx
+          sha256: 996d1c89e6cbc891a7c88bf410884c178ffa474f7b13084522ac74a5e144cc81
+          size: 133710896
+        decoder:
+          path: decoder-model.int8.onnx
+          url: https://huggingface.co/istupakov/canary-180m-flash-onnx/resolve/92c2231a4e2b2524277fea759be967d2e6edfc49/decoder-model.int8.onnx
+          sha256: 9dd9c447872088c912e916d73751f9621a54085d5bc46788454fe904db51a914
+          size: 79520211
+        nemo:
+          path: nemo128.onnx
+          url: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/nemo128.onnx
+          sha256: a9fde1486ebfcc08f328d75ad4610c67835fea58c73ba57e3209a6f6cf019e9f
+          size: 139764
+        vocabulary:
+          path: vocab.txt
+          url: https://huggingface.co/istupakov/canary-180m-flash-onnx/resolve/92c2231a4e2b2524277fea759be967d2e6edfc49/vocab.txt
+          sha256: 2dae6fc7815f9640645e0c765522b278ee0cef49b482d91f6913e334628d3e77
+          size: 53555
+  tts-rs:
+    kokoro-v1.0-int8:
+      kind: kokoro
+      revision: model-files-v1.0
+      languages: [en, es, fr, hi, it, ja, pt, zh]
+      files:
+        model:
+          path: kokoro-v1.0.int8.onnx
+          url: https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx
+          sha256: 6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb
+          size: 92361271
+        voices:
+          path: voices-v1.0.bin
+          url: https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+          sha256: bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d
+          size: 28214398
+  qwentts-cpp:
+    qwen3-tts-0.6b-base-q8_0:
+      kind: base
+      revision: e0f336a048a3de02b29b8ad92969217d9ecffe3e
+      languages: [en, zh, ja, ko, de, fr, ru, pt, es, it]
+      files:
+        talker:
+          path: qwen-talker-0.6b-base-Q8_0.gguf
+          url: https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/e0f336a048a3de02b29b8ad92969217d9ecffe3e/qwen-talker-0.6b-base-Q8_0.gguf
+          sha256: d54dbaf10591421fa764ed630d764efa717ae40cd959bd48c66d4eb1af226426
+          size: 992615488
+        codec: &qwen_codec
+          path: qwen-tokenizer-12hz-Q8_0.gguf
+          url: https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/e0f336a048a3de02b29b8ad92969217d9ecffe3e/qwen-tokenizer-12hz-Q8_0.gguf
+          sha256: 1883beeed99348fc35e23dd225e9082f93f6f8c109330a33d935baa8acdbfd94
+          size: 291150624
+    qwen3-tts-1.7b-base-q8_0:
+      kind: base
+      revision: e0f336a048a3de02b29b8ad92969217d9ecffe3e
+      languages: [en, zh, ja, ko, de, fr, ru, pt, es, it]
+      files:
+        talker:
+          path: qwen-talker-1.7b-base-Q8_0.gguf
+          url: https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/e0f336a048a3de02b29b8ad92969217d9ecffe3e/qwen-talker-1.7b-base-Q8_0.gguf
+          sha256: 4b9a33a236908dd9435a42f7a396e38038329d053b704342a6413c08544c4fda
+          size: 2079448256
+        codec: *qwen_codec
+    qwen3-tts-0.6b-custom-voice-q8_0:
+      kind: custom-voice
+      revision: e0f336a048a3de02b29b8ad92969217d9ecffe3e
+      languages: [en, zh, ja, ko, de, fr, ru, pt, es, it]
+      files:
+        talker:
+          path: qwen-talker-0.6b-customvoice-Q8_0.gguf
+          url: https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/e0f336a048a3de02b29b8ad92969217d9ecffe3e/qwen-talker-0.6b-customvoice-Q8_0.gguf
+          sha256: 4eb38675c736ed6ac72012846ac8d6ef80e5af8bc05726870f0b3a6569588519
+          size: 968588544
+        codec: *qwen_codec
+    qwen3-tts-1.7b-custom-voice-q8_0:
+      kind: custom-voice
+      revision: e0f336a048a3de02b29b8ad92969217d9ecffe3e
+      languages: [en, zh, ja, ko, de, fr, ru, pt, es, it]
+      files:
+        talker:
+          path: qwen-talker-1.7b-customvoice-Q8_0.gguf
+          url: https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/e0f336a048a3de02b29b8ad92969217d9ecffe3e/qwen-talker-1.7b-customvoice-Q8_0.gguf
+          sha256: cab2cff67a0a557310febe558dc83076b28ed790e491867eb2751759f4cd89fa
+          size: 2042834304
+        codec: *qwen_codec
+    qwen3-tts-1.7b-voice-design-q8_0:
+      kind: voice-design
+      revision: e0f336a048a3de02b29b8ad92969217d9ecffe3e
+      languages: [en, zh, ja, ko, de, fr, ru, pt, es, it]
+      files:
+        talker:
+          path: qwen-talker-1.7b-voicedesign-Q8_0.gguf
+          url: https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/e0f336a048a3de02b29b8ad92969217d9ecffe3e/qwen-talker-1.7b-voicedesign-Q8_0.gguf
+          sha256: 575610ab1ddcca4dca6bd9a64bcd859d93bbad8764f9cab24e1dbc0c51f62276
+          size: 2042833824
+        codec: *qwen_codec

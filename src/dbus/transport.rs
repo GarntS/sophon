@@ -1,21 +1,77 @@
 //! D-Bus request decoding, response mapping, and service-object transport.
 
-use std::{collections::BTreeMap, os::fd::OwnedFd};
+use std::{collections::BTreeMap, fs::File, os::fd::OwnedFd};
 
 use crate::{
-    audio::read_clone_fd,
+    audio::{decode_clone_wav, read_clone_fd},
     config::TtsConfig,
-    domain::{SophonError, TranscriptionOptions, TtsCapabilities, TtsRequest, VoiceIntent},
+    error::SophonError,
+    stt::TranscriptionOptions,
+    tts::{TtsCapabilities, TtsRequest, VoiceIntent},
 };
 
 pub const BUS_NAME: &str = "com.garntresearch.sophon";
 pub const OBJECT_PATH: &str = "/com/garntresearch/sophon";
 pub const INTERFACE: &str = "com.garntresearch.sophon";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicErrorKind {
+    NotReady,
+    InvalidOptions,
+    InvalidAudio,
+    ModelUnavailable,
+    ResourceLimit,
+    TranscriptionFailed,
+    InvalidTtsOptions,
+    InvalidReferenceAudio,
+    UnsupportedCapability,
+    OutputExists,
+    OutputFailed,
+    SynthesisFailed,
+    PlaybackFailed,
+}
+
+impl PublicErrorKind {
+    pub const fn from_error(error: &SophonError) -> Self {
+        match error {
+            SophonError::NotReady => Self::NotReady,
+            SophonError::InvalidOptions(_) => Self::InvalidOptions,
+            SophonError::InvalidAudio(_) => Self::InvalidAudio,
+            SophonError::ModelUnavailable(_) => Self::ModelUnavailable,
+            SophonError::ResourceLimit(_) => Self::ResourceLimit,
+            SophonError::TranscriptionFailed(_) => Self::TranscriptionFailed,
+            SophonError::InvalidTtsOptions(_) => Self::InvalidTtsOptions,
+            SophonError::InvalidReferenceAudio(_) => Self::InvalidReferenceAudio,
+            SophonError::UnsupportedCapability(_) => Self::UnsupportedCapability,
+            SophonError::OutputExists(_) => Self::OutputExists,
+            SophonError::OutputFailed(_) => Self::OutputFailed,
+            SophonError::SynthesisFailed(_) => Self::SynthesisFailed,
+            SophonError::PlaybackFailed(_) => Self::PlaybackFailed,
+        }
+    }
+
+    pub const fn dbus_name(self) -> &'static str {
+        match self {
+            Self::NotReady => "com.garntresearch.sophon.NotReady",
+            Self::InvalidOptions => "com.garntresearch.sophon.InvalidOptions",
+            Self::InvalidAudio => "com.garntresearch.sophon.InvalidAudio",
+            Self::ModelUnavailable => "com.garntresearch.sophon.ModelUnavailable",
+            Self::ResourceLimit => "com.garntresearch.sophon.ResourceLimit",
+            Self::TranscriptionFailed => "com.garntresearch.sophon.TranscriptionFailed",
+            Self::InvalidTtsOptions => "com.garntresearch.sophon.InvalidTtsOptions",
+            Self::InvalidReferenceAudio => "com.garntresearch.sophon.InvalidReferenceAudio",
+            Self::UnsupportedCapability => "com.garntresearch.sophon.UnsupportedCapability",
+            Self::OutputExists => "com.garntresearch.sophon.OutputExists",
+            Self::OutputFailed => "com.garntresearch.sophon.OutputFailed",
+            Self::SynthesisFailed => "com.garntresearch.sophon.SynthesisFailed",
+            Self::PlaybackFailed => "com.garntresearch.sophon.PlaybackFailed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OptionValue {
     String(String),
-    Bool(bool),
 }
 
 #[derive(Debug)]
@@ -33,12 +89,6 @@ pub fn decode_options(
     for (key, value) in values {
         match (key.as_str(), value) {
             ("language", OptionValue::String(language)) => options.language = Some(language),
-            ("translate", OptionValue::Bool(translate)) => options.translate = Some(translate),
-            ("language" | "translate", _) => {
-                return Err(SophonError::InvalidOptions(format!(
-                    "option `{key}` has the wrong type"
-                )));
-            }
             _ => {
                 return Err(SophonError::InvalidOptions(format!(
                     "unknown option `{key}`"
@@ -205,6 +255,21 @@ pub fn decode_tts_options(
             ));
         }
         VoiceIntent::Design(description)
+    } else if let Some((path, transcript)) = config.default_clone() {
+        if !capabilities.voice_cloning {
+            return Err(SophonError::UnsupportedCapability(
+                "configured clone defaults require voice-cloning support".into(),
+            ));
+        }
+        VoiceIntent::Clone {
+            reference: decode_clone_wav(
+                File::open(path)
+                    .map_err(|error| SophonError::InvalidReferenceAudio(error.to_string()))?,
+                config.operational.max_reference_audio_bytes,
+                config.operational.max_reference_audio_seconds,
+            )?,
+            transcript: transcript.map(str::to_owned),
+        }
     } else {
         VoiceIntent::Default
     };
@@ -218,16 +283,16 @@ pub fn decode_tts_options(
 }
 
 pub fn dbus_error(error: &SophonError) -> (&'static str, String) {
-    (error.public_kind().dbus_name(), error.to_string())
+    (
+        PublicErrorKind::from_error(error).dbus_name(),
+        error.to_string(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::{Config, ConfigPaths},
-        domain::PublicErrorKind,
-    };
+    use crate::config::{Config, ConfigPaths};
     use std::os::fd::OwnedFd;
 
     fn tts_config() -> TtsConfig {
@@ -248,7 +313,7 @@ mod tests {
     fn options_are_strict() {
         assert!(
             decode_options(
-                BTreeMap::from([("bad".into(), OptionValue::Bool(true))]),
+                BTreeMap::from([("bad".into(), OptionValue::String("true".into()))]),
                 &TranscriptionOptions::default()
             )
             .is_err()
