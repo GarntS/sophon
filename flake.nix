@@ -105,7 +105,7 @@
                 ++ pkgs.lib.optionals (qwenBackend == "vulkan") [ pkgs.vulkan-loader ];
             in pkgs.rustPlatform.buildRustPackage {
               pname = name;
-              version = "2026.2.0";
+              version = "2026.2.1";
               src = self;
               cargoLock.lockFile = ./Cargo.lock;
               cargoBuildFlags = [ "--bins" ] ++ featureFlags;

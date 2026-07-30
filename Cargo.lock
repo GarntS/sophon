@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "sophon"
-version = "2026.2.0"
+version = "2026.2.1"
 dependencies = [
  "cpal",
  "directories",

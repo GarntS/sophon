@@ -1,13 +1,11 @@
 //! Provider-neutral text-to-speech engine contract and scheduling.
 
 pub mod playback;
-#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
 mod qwen;
 pub mod service;
 pub mod types;
 mod worker;
 
-#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
 pub use qwen::{
     QwenEngineAdapter, QwenTtsBaseProvider, QwenTtsCustomVoiceProvider, QwenTtsVoiceDesignProvider,
     normalize_qwen_language,
@@ -183,48 +181,38 @@ pub fn create_tts_provider(
                     "typed TTS configuration does not match resolved model `{resolved_id}`"
                 )));
             }
-            #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
-            {
-                let engine = QwenEngineAdapter::load(
-                    &talker_path,
-                    &codec_path,
-                    sampling,
-                    config.operational.max_generated_audio_seconds,
-                )?;
-                let provider: Box<dyn TtsProvider> = match variant {
-                    TtsProviderConfig::QwenBase { .. } => Box::new(QwenTtsBaseProvider::new(
+            let engine = QwenEngineAdapter::load(
+                &talker_path,
+                &codec_path,
+                sampling,
+                config.operational.max_generated_audio_seconds,
+            )?;
+            let provider: Box<dyn TtsProvider> = match variant {
+                TtsProviderConfig::QwenBase { .. } => Box::new(QwenTtsBaseProvider::new(
+                    engine,
+                    model_id,
+                    config.operational.max_text_bytes,
+                )),
+                TtsProviderConfig::QwenCustomVoice { default_voice, .. } => {
+                    Box::new(QwenTtsCustomVoiceProvider::new(
                         engine,
                         model_id,
+                        default_voice,
                         config.operational.max_text_bytes,
-                    )),
-                    TtsProviderConfig::QwenCustomVoice { default_voice, .. } => {
-                        Box::new(QwenTtsCustomVoiceProvider::new(
-                            engine,
-                            model_id,
-                            default_voice,
-                            config.operational.max_text_bytes,
-                        )?)
-                    }
-                    TtsProviderConfig::QwenVoiceDesign {
-                        default_voice_description,
-                        ..
-                    } => Box::new(QwenTtsVoiceDesignProvider::new(
-                        engine,
-                        model_id,
-                        default_voice_description,
-                        config.operational.max_text_bytes,
-                    )),
-                    TtsProviderConfig::Kokoro { .. } => unreachable!(),
-                };
-                Ok(provider)
-            }
-            #[cfg(not(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan")))]
-            {
-                let _ = (sampling, talker_path, codec_path);
-                Err(SophonError::ModelUnavailable(
-                    "this Sophon build has no Qwen backend".into(),
-                ))
-            }
+                    )?)
+                }
+                TtsProviderConfig::QwenVoiceDesign {
+                    default_voice_description,
+                    ..
+                } => Box::new(QwenTtsVoiceDesignProvider::new(
+                    engine,
+                    model_id,
+                    default_voice_description,
+                    config.operational.max_text_bytes,
+                )),
+                TtsProviderConfig::Kokoro { .. } => unreachable!(),
+            };
+            Ok(provider)
         }
         (TtsProviderConfig::QwenBase { .. }, TtsProviderModel::KokoroDirectory(_))
         | (TtsProviderConfig::QwenCustomVoice { .. }, TtsProviderModel::KokoroDirectory(_))

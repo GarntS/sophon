@@ -372,6 +372,21 @@ impl Config {
         catalog: &ModelCatalog,
     ) -> Result<Self, ConfigError> {
         let cache_dir = file.cache_dir.unwrap_or(default_cache);
+        // The resolved top-level cache root is validated before TTS conversion
+        // so a strictly invalid override fails configuration rather than
+        // silently selecting the XDG-derived default. A nonexistent absolute
+        // root is accepted because the registry creates it on first use.
+        if !cache_dir.is_absolute() {
+            return Err(ConfigError::Invalid(
+                "cache_dir must be an absolute directory path".into(),
+            ));
+        }
+        if cache_dir.exists() && !cache_dir.is_dir() {
+            return Err(ConfigError::Invalid(format!(
+                "cache_dir `{}` exists and is not a directory",
+                cache_dir.display()
+            )));
+        }
         let tts = TtsConfig::from_value(file.tts, cache_dir.clone(), catalog);
         let config = Self {
             provider: file.provider,
@@ -960,5 +975,42 @@ mod tests {
         let (path, transcript) = tts.default_clone().unwrap();
         assert_eq!(path, &reference);
         assert_eq!(transcript, Some("hello"));
+    }
+
+    #[test]
+    fn cache_override_shares_one_validated_root_for_stt_and_tts() {
+        // Omitted override selects the XDG-derived model cache.
+        let (_root, paths) = fixture(None);
+        let config = Config::load_with_catalog(&paths, &catalog()).unwrap();
+        assert_eq!(config.cache_dir, paths.model_cache);
+        assert_eq!(config.tts.unwrap().operational.cache_dir, config.cache_dir);
+
+        // A valid absolute override is accepted even when it does not exist and
+        // becomes the one shared root for registry artifacts and TTS data.
+        let nonexistent = PathBuf::from("/tmp/sophon-cache-does-not-exist-yet");
+        assert!(!nonexistent.exists());
+        let yaml = format!("cache_dir: {}\n", nonexistent.display());
+        let (_root, paths) = fixture(Some(&yaml));
+        let config = Config::load_with_catalog(&paths, &catalog()).unwrap();
+        assert_eq!(config.cache_dir, nonexistent);
+        assert_eq!(config.tts.unwrap().operational.cache_dir, config.cache_dir);
+
+        // A relative override fails strict configuration without falling back.
+        let (_root, paths) = fixture(Some("cache_dir: relative/cache\n"));
+        let error = Config::load_with_catalog(&paths, &catalog()).unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(_)));
+        assert!(error.to_string().contains("absolute"));
+
+        // An override that exists as a regular file fails strict configuration.
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-directory");
+        fs::write(&file, b"bytes").unwrap();
+        let yaml = format!("cache_dir: {}\n", file.display());
+        let paths = ConfigPaths::from_homes(root.path().join("config"), root.path().join("cache"));
+        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+        fs::write(&paths.config_file, &yaml).unwrap();
+        let error = Config::load_with_catalog(&paths, &catalog()).unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(_)));
+        assert!(error.to_string().contains("not a directory"));
     }
 }

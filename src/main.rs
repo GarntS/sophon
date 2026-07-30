@@ -1,11 +1,13 @@
 //! Daemon composition and provider-handle startup.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use sophon::{
     config::{
-        Config, ConfigPaths, DEFAULT_MAX_AUDIO_BYTES, DEFAULT_MAX_AUDIO_SECONDS, DEFAULT_MODEL_ID,
-        DEFAULT_STT_PROVIDER, DEFAULT_TTS_MODEL_ID, DEFAULT_TTS_PROVIDER, Quantization, TtsConfig,
+        Config, ConfigError, ConfigPaths, DEFAULT_MAX_AUDIO_BYTES, DEFAULT_MAX_AUDIO_SECONDS,
+        DEFAULT_MODEL_ID, DEFAULT_STT_PROVIDER, DEFAULT_TTS_MODEL_ID, DEFAULT_TTS_PROVIDER,
+        Quantization, TtsConfig,
     },
     dbus::{
         SophonDbus,
@@ -13,7 +15,8 @@ use sophon::{
     },
     error::SophonError,
     model_registry::{
-        LoaderKind, ModelRegistry, common_model_root, package_registry_path, require_roles,
+        LoaderKind, ModelCatalog, ModelRegistry, common_model_root, package_registry_path,
+        require_roles,
     },
     provider_runtime::{SttProviderHandle, TtsProviderHandle},
     stt::{STTService, STTWorker, TranscriptionOptions, backend},
@@ -23,7 +26,6 @@ use sophon::{
     },
 };
 
-#[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
 fn install_qwen_log_bridge() {
     qwentts_cpp::set_log_callback(Some(Arc::new(|level, message| match level {
         qwentts_cpp::LogLevel::Debug => tracing::debug!(target: "qwentts_cpp", "{message}"),
@@ -33,8 +35,20 @@ fn install_qwen_log_bridge() {
     })));
 }
 
-#[cfg(not(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan")))]
-fn install_qwen_log_bridge() {}
+/// Selects the cache root for the process-global registry from validated
+/// configuration, falling back to the inert XDG-derived root only when
+/// configuration is invalid so that no model resolution is started until
+/// configuration succeeds. Kept pure and allocation-free to stay testable
+/// without exposing registry internals.
+fn registry_cache_root(
+    config: &Result<Config, ConfigError>,
+    default_cache: &std::path::Path,
+) -> PathBuf {
+    match config {
+        Ok(config) => config.cache_dir.clone(),
+        Err(_) => default_cache.to_owned(),
+    }
+}
 
 fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
@@ -52,21 +66,16 @@ async fn initialize(
         .metadata(handle.provider(), handle.model())
         .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?
         .clone();
-    let (engine, roles): (_, &[&str]) = match metadata.kind {
-        LoaderKind::Parakeet => (
-            sophon::config::Engine::Parakeet,
-            &["encoder", "decoder_joint", "nemo", "vocabulary"],
-        ),
-        LoaderKind::Canary => (
-            sophon::config::Engine::Canary,
-            &["encoder", "decoder", "nemo", "vocabulary"],
-        ),
+    let engine = match metadata.kind {
+        LoaderKind::Parakeet => sophon::config::Engine::Parakeet,
+        LoaderKind::Canary => sophon::config::Engine::Canary,
         kind => {
             return Err(SophonError::ModelUnavailable(format!(
                 "unsupported STT registry kind `{kind:?}`"
             )));
         }
     };
+    let roles = metadata.kind.required_roles();
     handle.begin_resolution();
     let paths = handle
         .registry()
@@ -124,7 +133,7 @@ async fn initialize_tts(
     let identity = format!("{}/{}", handle.provider(), handle.model());
     let provider_model = match metadata.kind {
         LoaderKind::Kokoro => {
-            require_roles(&paths, &["model", "voices"], &identity)
+            require_roles(&paths, metadata.kind.required_roles(), &identity)
                 .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
             TtsProviderModel::KokoroDirectory(
                 common_model_root(&paths, &identity)
@@ -132,7 +141,7 @@ async fn initialize_tts(
             )
         }
         LoaderKind::Base | LoaderKind::CustomVoice | LoaderKind::VoiceDesign => {
-            require_roles(&paths, &["talker", "codec"], &identity)
+            require_roles(&paths, metadata.kind.required_roles(), &identity)
                 .map_err(|error| SophonError::ModelUnavailable(error.to_string()))?;
             TtsProviderModel::Qwen {
                 model_id: handle.model().to_owned(),
@@ -187,12 +196,14 @@ async fn initialize_tts(
 async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
     install_qwen_log_bridge();
     let paths = ConfigPaths::discover()?;
-    let registry = ModelRegistry::initialize_global(ModelRegistry::from_path(
-        &package_registry_path(),
-        paths.model_cache.clone(),
+    let package_path = package_registry_path();
+    let catalog = ModelCatalog::load(&package_path)?;
+    let config = Config::load_with_catalog(&paths, &catalog);
+    let registry = ModelRegistry::initialize_global(ModelRegistry::new(
+        catalog,
+        registry_cache_root(&config, &paths.model_cache),
         reqwest::Client::new(),
-    )?)?;
-    let config = Config::load_with_catalog(&paths, registry.catalog());
+    ))?;
     let (stt_provider, stt_model, tts_provider, tts_model) = match &config {
         Ok(config) => match &config.tts {
             Ok(tts) => (
@@ -302,4 +313,61 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
     });
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sophon::model_registry::ModelCatalog;
+    use std::fs;
+
+    fn catalog() -> ModelCatalog {
+        ModelCatalog::from_yaml(include_str!("../model_registry.yaml")).unwrap()
+    }
+
+    fn fixture(contents: Option<&str>) -> (tempfile::TempDir, ConfigPaths) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_homes(root.path().join("config"), root.path().join("cache"));
+        if let Some(contents) = contents {
+            fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+            fs::write(&paths.config_file, contents).unwrap();
+        }
+        (root, paths)
+    }
+
+    #[test]
+    fn valid_cache_override_is_passed_to_registry_construction() {
+        let (_root, paths) = fixture(Some("cache_dir: /opt/sophon-cache\n"));
+        let config = Config::load_with_catalog(&paths, &catalog());
+        assert!(config.is_ok());
+        assert_eq!(
+            registry_cache_root(&config, &paths.model_cache),
+            PathBuf::from("/opt/sophon-cache")
+        );
+    }
+
+    #[test]
+    fn omitted_cache_override_uses_the_xdg_model_cache() {
+        let (_root, paths) = fixture(None);
+        let config = Config::load_with_catalog(&paths, &catalog()).unwrap();
+        assert_eq!(config.cache_dir, paths.model_cache);
+        assert_eq!(
+            registry_cache_root(&Ok(config), &paths.model_cache),
+            paths.model_cache
+        );
+    }
+
+    #[test]
+    fn invalid_configuration_selects_the_inert_root_and_starts_no_resolution() {
+        let (_root, paths) = fixture(Some("provider: transcribe-rs\nmodel_id: missing\n"));
+        let config = Config::load_with_catalog(&paths, &catalog());
+        // Strict configuration fails; the helper keeps the inert XDG root so
+        // `run_async` constructs the registry only for the unavailable lifecycle
+        // and never reaches `initialize`/`initialize_tts`.
+        assert!(config.is_err());
+        assert_eq!(
+            registry_cache_root(&config, &paths.model_cache),
+            paths.model_cache
+        );
+    }
 }

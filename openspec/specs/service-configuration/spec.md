@@ -52,15 +52,23 @@ Configuration SHALL remain immutable for the daemon process lifetime, and changi
 - **THEN** the new process validates and applies the changed values before loading its model
 
 ### Requirement: XDG model cache override
-The default model cache SHALL be `sophon/models` beneath `$XDG_CACHE_HOME` when set and `~/.cache/sophon/models` otherwise, and a valid configured cache directory SHALL override that default.
+The default model cache SHALL be `sophon/models` beneath `$XDG_CACHE_HOME` when set and `~/.cache/sophon/models` otherwise. A configured cache directory SHALL be absolute, SHALL be either nonexistent or an existing directory, and SHALL override the default as the one shared root for registry artifact acquisition, verified model views, and provider cache data. An invalid configured root SHALL fail strict configuration before model resolution and SHALL NOT silently select the XDG default.
 
 #### Scenario: No cache override is configured
 - **WHEN** model acquisition needs a cache and configuration omits `cache_dir`
-- **THEN** the service uses the XDG-derived model cache path
+- **THEN** the service uses the XDG-derived model cache path as the shared registry root
 
 #### Scenario: Cache override is configured
-- **WHEN** configuration supplies a writable cache directory
-- **THEN** automatic model acquisition and lookup use that directory
+- **WHEN** configuration supplies a valid absolute cache directory
+- **THEN** automatic model acquisition, lookup, assembled views, and provider cache data use that directory
+
+#### Scenario: Nonexistent absolute cache override is configured
+- **WHEN** configuration supplies an absolute cache path that does not yet exist
+- **THEN** configuration accepts it and model acquisition creates the required cache directories on first use
+
+#### Scenario: Invalid cache override is configured
+- **WHEN** configuration supplies a relative cache path or a path that exists as a non-directory
+- **THEN** strict configuration fails before registry resolution without falling back to the XDG cache
 
 ### Requirement: Independent TTS configuration
 The startup YAML SHALL accept an optional strict TTS section containing provider/model identifiers, mode-applicable defaults, Qwen sampling, default speed, optional CPAL PipeWire output device ID, playback volume, text and audio limits, generated duration, and queue capacity. It SHALL NOT accept a legacy PipeWire node field, model path, cache override, or automatic-download field.

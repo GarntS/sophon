@@ -57,6 +57,21 @@ pub enum LoaderKind {
     VoiceDesign,
 }
 
+impl LoaderKind {
+    /// The exact semantic file-role keys a manifest of this kind must contain.
+    /// `ModelCatalog::validate` enforces this set during package-catalog loading,
+    /// before any resolution attempt is created; `initialize`/`initialize_tts`
+    /// re-check it after resolution as a consumer-boundary defense.
+    pub const fn required_roles(self) -> &'static [&'static str] {
+        match self {
+            Self::Parakeet => &["encoder", "decoder_joint", "nemo", "vocabulary"],
+            Self::Canary => &["encoder", "decoder", "nemo", "vocabulary"],
+            Self::Kokoro => &["model", "voices"],
+            Self::Base | Self::CustomVoice | Self::VoiceDesign => &["talker", "codec"],
+        }
+    }
+}
+
 /// Languages understood by the curated providers.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -281,6 +296,16 @@ impl ModelCatalog {
                             file.path.display()
                         )));
                     }
+                }
+                let expected: std::collections::BTreeSet<&str> =
+                    manifest.kind.required_roles().iter().copied().collect();
+                let actual: std::collections::BTreeSet<&str> =
+                    manifest.files.keys().map(String::as_str).collect();
+                if actual != expected {
+                    return Err(RegistryError::Invalid(format!(
+                        "model `{provider}/{model}` has roles {actual:?}; expected {expected:?} for kind `{:?}`",
+                        manifest.kind
+                    )));
                 }
             }
         }
@@ -871,6 +896,21 @@ providers:
           url: https://example.com/encoder.onnx
           sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           size: 42
+        decoder_joint:
+          path: decoder_joint.onnx
+          url: https://example.com/decoder_joint.onnx
+          sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          size: 43
+        nemo:
+          path: nemo.onnx
+          url: https://example.com/nemo.onnx
+          sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          size: 44
+        vocabulary:
+          path: vocab.txt
+          url: https://example.com/vocab.txt
+          sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+          size: 45
 "#;
 
     #[test]
@@ -935,6 +975,97 @@ providers:
             .map(|model| model.files["codec"].identity())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(identities.len(), 1);
+    }
+
+    fn role_catalog_yaml(kind: &str, roles: &[&str]) -> String {
+        use std::fmt::Write as _;
+        let mut yaml = String::from("providers:\n  fixture:\n    model:\n");
+        let _ = writeln!(yaml, "      kind: {kind}");
+        let _ = writeln!(yaml, "      revision: abc123");
+        let _ = writeln!(yaml, "      languages: [en]");
+        let _ = writeln!(yaml, "      files:");
+        for (index, role) in roles.iter().enumerate() {
+            // Build a distinct, valid 64-character lowercase-hex digest per role.
+            let mut digest = String::from("a").repeat(63);
+            digest.push(char::from(b'0' + index as u8));
+            let _ = writeln!(yaml, "        {role}:");
+            let _ = writeln!(yaml, "          path: file{index}.bin");
+            let _ = writeln!(yaml, "          url: https://example.com/file{index}.bin");
+            let _ = writeln!(yaml, "          sha256: {digest}");
+            let _ = writeln!(yaml, "          size: {}", index as u64 + 1);
+        }
+        yaml
+    }
+
+    #[test]
+    fn catalog_enforces_exact_role_set_for_every_loader_kind() {
+        let cases = [
+            (
+                LoaderKind::Parakeet,
+                "parakeet",
+                &["encoder", "decoder_joint", "nemo", "vocabulary"][..],
+            ),
+            (
+                LoaderKind::Canary,
+                "canary",
+                &["encoder", "decoder", "nemo", "vocabulary"],
+            ),
+            (LoaderKind::Kokoro, "kokoro", &["model", "voices"]),
+            (LoaderKind::Base, "base", &["talker", "codec"]),
+            (
+                LoaderKind::CustomVoice,
+                "custom-voice",
+                &["talker", "codec"],
+            ),
+            (
+                LoaderKind::VoiceDesign,
+                "voice-design",
+                &["talker", "codec"],
+            ),
+        ];
+        for (kind, kind_str, roles) in cases {
+            // The exact accepted role set loads for the daemon lifetime.
+            assert!(
+                ModelCatalog::from_yaml(&role_catalog_yaml(kind_str, roles)).is_ok(),
+                "exact roles for kind {kind:?} were rejected"
+            );
+            // Matching the loader's required_roles() is equivalent.
+            assert_eq!(kind.required_roles(), roles);
+            // Missing any one role fails before resolution/network work.
+            for index in 0..roles.len() {
+                let missing: Vec<&str> = roles
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != index)
+                    .map(|(_, role)| *role)
+                    .collect();
+                let error =
+                    ModelCatalog::from_yaml(&role_catalog_yaml(kind_str, &missing)).unwrap_err();
+                assert!(
+                    matches!(error, RegistryError::Invalid(_)),
+                    "missing role {:?} for {kind:?} not rejected",
+                    roles[index]
+                );
+            }
+            // An extra role fails.
+            let mut extra = roles.to_vec();
+            extra.push("extra");
+            assert!(
+                ModelCatalog::from_yaml(&role_catalog_yaml(kind_str, &extra)).is_err(),
+                "extra role for kind {kind:?} accepted"
+            );
+            // A cross-kind substituted role fails.
+            let foreign = match kind {
+                LoaderKind::Parakeet | LoaderKind::Canary => "model",
+                _ => "encoder",
+            };
+            let mut substituted = roles.to_vec();
+            *substituted.last_mut().unwrap() = foreign;
+            assert!(
+                ModelCatalog::from_yaml(&role_catalog_yaml(kind_str, &substituted)).is_err(),
+                "cross-kind role substitution for {kind:?} accepted"
+            );
+        }
     }
 
     fn fixture_catalog(revision: &str, files: Vec<(&str, &str, String, &[u8])>) -> ModelCatalog {
