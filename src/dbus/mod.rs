@@ -254,9 +254,9 @@ impl SophonDbus {
         values: HashMap<String, OwnedValue>,
     ) -> Result<String, SophonDbusError> {
         let options = self.options(values)?;
-        let samples = read_file(path.as_ref(), self.max_audio_bytes, self.max_audio_seconds)?;
+        let audio = read_file(path.as_ref(), self.max_audio_bytes, self.max_audio_seconds)?;
         self.service()?
-            .transcribe(samples, options)
+            .transcribe(audio, options)
             .await
             .map_err(Into::into)
     }
@@ -269,9 +269,9 @@ impl SophonDbus {
     ) -> Result<String, SophonDbusError> {
         let options = self.options(values)?;
         let fd: OwnedFd = fd.into();
-        let samples = read_unix_fd(fd, self.max_audio_bytes, self.max_audio_seconds)?;
+        let audio = read_unix_fd(fd, self.max_audio_bytes, self.max_audio_seconds)?;
         self.service()?
-            .transcribe(samples, options)
+            .transcribe(audio, options)
             .await
             .map_err(Into::into)
     }

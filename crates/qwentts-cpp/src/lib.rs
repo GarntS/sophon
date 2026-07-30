@@ -1,8 +1,8 @@
 //! A safe, stateful wrapper around the qwentts.cpp C ABI.
 //!
 //! The selected Cargo backend feature builds the vendored qwentts.cpp source.
-//! The crate deliberately exposes no streaming or provider-neutral abstraction;
-//! it owns one loaded Qwen engine.
+//! The crate exposes buffered and synchronous streaming synthesis while owning
+//! one loaded Qwen engine.
 
 mod raw;
 
@@ -10,7 +10,10 @@ use std::{
     ffi::{CStr, CString, NulError, c_char, c_void},
     path::Path,
     ptr::NonNull,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use thiserror::Error;
@@ -34,6 +37,12 @@ pub enum QwenTtsError {
         status: i32,
         diagnostic: String,
     },
+    #[error("streaming synthesis was cancelled by the consumer")]
+    StreamCancelled,
+    #[error("streaming synthesis callback panicked")]
+    StreamCallbackPanicked,
+    #[error("native streaming callback supplied an invalid sample buffer")]
+    InvalidStreamChunk,
     #[error("WAV output failed: {0}")]
     Wav(#[from] hound::Error),
 }
@@ -258,6 +267,103 @@ impl Default for SynthesisOptions<'_> {
     }
 }
 
+/// Rust-owned audio produced by one native streaming callback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamChunk {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+/// Control returned by a streaming consumer after receiving a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamControl {
+    Continue,
+    Cancel,
+}
+
+const STREAM_RUNNING: u8 = 0;
+const STREAM_CANCELLED: u8 = 1;
+const STREAM_PANICKED: u8 = 2;
+const STREAM_INVALID_CHUNK: u8 = 3;
+const QWEN_SAMPLE_RATE: u32 = 24_000;
+
+struct StreamCallbackState<F> {
+    callback: Mutex<F>,
+    termination: AtomicU8,
+}
+
+impl<F> StreamCallbackState<F> {
+    fn new(callback: F) -> Self {
+        Self {
+            callback: Mutex::new(callback),
+            termination: AtomicU8::new(STREAM_RUNNING),
+        }
+    }
+
+    fn error(&self) -> Option<QwenTtsError> {
+        match self.termination.load(Ordering::Acquire) {
+            STREAM_RUNNING => None,
+            STREAM_CANCELLED => Some(QwenTtsError::StreamCancelled),
+            STREAM_PANICKED => Some(QwenTtsError::StreamCallbackPanicked),
+            STREAM_INVALID_CHUNK => Some(QwenTtsError::InvalidStreamChunk),
+            _ => Some(QwenTtsError::InvalidStreamChunk),
+        }
+    }
+}
+
+unsafe extern "C" fn stream_chunk_trampoline<F>(
+    samples: *const f32,
+    n_samples: i32,
+    user_data: *mut c_void,
+) -> bool
+where
+    F: FnMut(StreamChunk) -> StreamControl + Send,
+{
+    if user_data.is_null() {
+        return false;
+    }
+    // SAFETY: synthesize_streaming passes a live, pinned state for the
+    // duration of the synchronous native call. Native callback invocations
+    // for one request are serialized; the mutex also makes worker-thread
+    // access safe and guards the FnMut state.
+    let state = unsafe { &*(user_data.cast::<StreamCallbackState<F>>()) };
+    if samples.is_null() || n_samples <= 0 {
+        state
+            .termination
+            .store(STREAM_INVALID_CHUNK, Ordering::Release);
+        return false;
+    }
+    if state.termination.load(Ordering::Acquire) != STREAM_RUNNING {
+        return false;
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: qwentts.cpp guarantees this temporary buffer contains
+        // n_samples initialized values for this callback invocation. Copy it
+        // before calling safe consumer code so native storage cannot escape.
+        let owned = unsafe { std::slice::from_raw_parts(samples, n_samples as usize) }.to_vec();
+        let mut callback = state
+            .callback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        callback(StreamChunk {
+            samples: owned,
+            sample_rate: QWEN_SAMPLE_RATE,
+        })
+    }));
+    match result {
+        Ok(StreamControl::Continue) => true,
+        Ok(StreamControl::Cancel) => {
+            state.termination.store(STREAM_CANCELLED, Ordering::Release);
+            false
+        }
+        Err(_) => {
+            state.termination.store(STREAM_PANICKED, Ordering::Release);
+            false
+        }
+    }
+}
+
 /// Rust-owned audio produced by a synthesis call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SynthesisResult {
@@ -287,6 +393,75 @@ impl SynthesisResult {
         }
         writer.finalize()?;
         Ok(())
+    }
+}
+
+fn with_synthesis_params<T>(
+    text: &str,
+    options: Option<SynthesisOptions<'_>>,
+    invoke: impl FnOnce(&mut raw::qt_tts_params) -> Result<T, QwenTtsError>,
+) -> Result<T, QwenTtsError> {
+    if text.is_empty() {
+        return Err(QwenTtsError::EmptyText);
+    }
+    let text = c_string(text, "text")?;
+    let options = options.unwrap_or_default();
+    let language = options
+        .language
+        .as_str()
+        .map(|value| c_string(value, "language"))
+        .transpose()?;
+    let (speaker, instruction, transcript, reference) = match options.voice {
+        Voice::Default => (None, None, None, None),
+        Voice::Named(name) => (Some(c_string(name, "speaker")?), None, None, None),
+        Voice::Clone(reference) => (None, None, None, Some(reference)),
+        Voice::CloneWithTranscript {
+            reference,
+            transcript,
+        } => (
+            None,
+            None,
+            Some(c_string(transcript, "transcript")?),
+            Some(reference),
+        ),
+        Voice::Design(instruction) => (
+            None,
+            Some(c_string(instruction, "instruction")?),
+            None,
+            None,
+        ),
+    };
+    // SAFETY: native defaults initialize every field. All pointers installed
+    // below refer to locals that remain alive through the synchronous invoke.
+    unsafe {
+        let mut params = std::mem::zeroed();
+        raw::qt_tts_default_params(&mut params);
+        params.text = text.as_ptr();
+        params.lang = language
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr());
+        params.speaker = speaker
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr());
+        params.instruct = instruction
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr());
+        params.ref_text = transcript
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr());
+        params.seed = options.sampling.seed.unwrap_or(-1);
+        params.max_new_tokens = options.sampling.max_new_tokens as i32;
+        params.temperature = options.sampling.temperature;
+        params.top_k = options.sampling.top_k as i32;
+        params.top_p = options.sampling.top_p;
+        params.repetition_penalty = options.sampling.repetition_penalty;
+        if let Some(reference) = reference {
+            params.ref_spk_emb = reference.raw.ref_spk_emb;
+            params.ref_spk_dim = reference.raw.ref_spk_dim;
+            params.ref_codes = reference.raw.ref_codes;
+            params.ref_T = reference.raw.ref_T;
+        }
+        invoke(&mut params)
     }
 }
 
@@ -390,84 +565,67 @@ impl QwenTtsEngine {
         text: &str,
         options: Option<SynthesisOptions<'_>>,
     ) -> Result<SynthesisResult, QwenTtsError> {
-        if text.is_empty() {
-            return Err(QwenTtsError::EmptyText);
-        }
         let context = self.context("synthesis")?;
-        let text = c_string(text, "text")?;
-        let options = options.unwrap_or_default();
-        let language = options
-            .language
-            .as_str()
-            .map(|value| c_string(value, "language"))
-            .transpose()?;
-        let (speaker, instruction, transcript, reference) = match options.voice {
-            Voice::Default => (None, None, None, None),
-            Voice::Named(name) => (Some(c_string(name, "speaker")?), None, None, None),
-            Voice::Clone(reference) => (None, None, None, Some(reference)),
-            Voice::CloneWithTranscript {
-                reference,
-                transcript,
-            } => (
-                None,
-                None,
-                Some(c_string(transcript, "transcript")?),
-                Some(reference),
-            ),
-            Voice::Design(instruction) => (
-                None,
-                Some(c_string(instruction, "instruction")?),
-                None,
-                None,
-            ),
-        };
-        // SAFETY: pointers refer to the local C strings/reference for this synchronous call.
-        unsafe {
-            let mut params = std::mem::zeroed();
-            raw::qt_tts_default_params(&mut params);
-            params.text = text.as_ptr();
-            params.lang = language
-                .as_ref()
-                .map_or(std::ptr::null(), |value| value.as_ptr());
-            params.speaker = speaker
-                .as_ref()
-                .map_or(std::ptr::null(), |value| value.as_ptr());
-            params.instruct = instruction
-                .as_ref()
-                .map_or(std::ptr::null(), |value| value.as_ptr());
-            params.ref_text = transcript
-                .as_ref()
-                .map_or(std::ptr::null(), |value| value.as_ptr());
-            params.seed = options.sampling.seed.unwrap_or(-1);
-            params.max_new_tokens = options.sampling.max_new_tokens as i32;
-            params.temperature = options.sampling.temperature;
-            params.top_k = options.sampling.top_k as i32;
-            params.top_p = options.sampling.top_p;
-            params.repetition_penalty = options.sampling.repetition_penalty;
-            if let Some(reference) = reference {
-                params.ref_spk_emb = reference.raw.ref_spk_emb;
-                params.ref_spk_dim = reference.raw.ref_spk_dim;
-                params.ref_codes = reference.raw.ref_codes;
-                params.ref_T = reference.raw.ref_T;
-            }
-            let mut audio: raw::qt_audio = std::mem::zeroed();
-            let status = raw::qt_synthesize(context.as_ptr(), &params, &mut audio) as i32;
-            if status != 0 {
+        with_synthesis_params(text, options, |params| {
+            // SAFETY: context is exclusively borrowed and params owns valid
+            // pointers for this synchronous call.
+            unsafe {
+                let mut audio: raw::qt_audio = std::mem::zeroed();
+                let status = raw::qt_synthesize(context.as_ptr(), params, &mut audio) as i32;
+                if status != 0 {
+                    raw::qt_audio_free(&mut audio);
+                    return Err(QwenTtsError::native("synthesis", status));
+                }
+                let samples = if audio.samples.is_null() || audio.n_samples <= 0 {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(audio.samples, audio.n_samples as usize).to_vec()
+                };
+                let sample_rate = audio.sample_rate.max(0) as u32;
                 raw::qt_audio_free(&mut audio);
-                return Err(QwenTtsError::native("synthesis", status));
+                Ok(SynthesisResult {
+                    samples,
+                    sample_rate,
+                })
             }
-            let samples = if audio.samples.is_null() || audio.n_samples <= 0 {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(audio.samples, audio.n_samples as usize).to_vec()
-            };
-            let sample_rate = audio.sample_rate.max(0) as u32;
-            raw::qt_audio_free(&mut audio);
-            Ok(SynthesisResult {
-                samples,
-                sample_rate,
-            })
-        }
+        })
+    }
+
+    /// Runs synchronous native streaming synthesis. The callback may execute
+    /// on a qwentts.cpp worker thread, receives only owned chunks, and must not
+    /// call back into this exclusively borrowed engine.
+    pub fn synthesize_streaming<F>(
+        &mut self,
+        text: &str,
+        options: Option<SynthesisOptions<'_>>,
+        callback: F,
+    ) -> Result<(), QwenTtsError>
+    where
+        F: FnMut(StreamChunk) -> StreamControl + Send,
+    {
+        let context = self.context("streaming synthesis")?;
+        let state = StreamCallbackState::new(callback);
+        with_synthesis_params(text, options, |params| {
+            params.on_chunk = Some(stream_chunk_trampoline::<F>);
+            params.on_chunk_user_data = (&state as *const StreamCallbackState<F>).cast_mut().cast();
+            // SAFETY: context and params remain valid through this synchronous
+            // call; state remains pinned on this stack until native callbacks
+            // have stopped and qt_synthesize returns.
+            unsafe {
+                let mut audio: raw::qt_audio = std::mem::zeroed();
+                let status = raw::qt_synthesize(context.as_ptr(), params, &mut audio) as i32;
+                // Streaming mode promises no buffered duplicate. Freeing the
+                // zeroed output is safe and also contains a native violation.
+                raw::qt_audio_free(&mut audio);
+                if let Some(error) = state.error() {
+                    return Err(error);
+                }
+                if status != 0 {
+                    return Err(QwenTtsError::native("streaming synthesis", status));
+                }
+                Ok(())
+            }
+        })
     }
 
     pub fn extract_voice_reference(
@@ -538,8 +696,72 @@ mod tests {
     assert_impl_all!(QwenTtsEngine: Send);
     assert_not_impl_any!(QwenTtsEngine: Sync);
     assert_impl_all!(LogCallback: Send, Sync);
+    assert_impl_all!(StreamChunk: Send);
+    assert_impl_all!(StreamControl: Send);
 
     static LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    unsafe fn emit_stream_chunk<F>(
+        state: &StreamCallbackState<F>,
+        samples: *const f32,
+        n_samples: i32,
+    ) -> bool
+    where
+        F: FnMut(StreamChunk) -> StreamControl + Send,
+    {
+        // SAFETY: the fixture keeps state and any supplied samples live.
+        unsafe {
+            stream_chunk_trampoline::<F>(
+                samples,
+                n_samples,
+                (state as *const StreamCallbackState<F>).cast_mut().cast(),
+            )
+        }
+    }
+
+    #[test]
+    fn stream_trampoline_copies_chunks_and_contains_consumer_termination() {
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&chunks);
+        let state = StreamCallbackState::new(move |chunk: StreamChunk| {
+            captured.lock().unwrap().push(chunk);
+            StreamControl::Continue
+        });
+        let mut native = vec![0.25, -0.5];
+        // SAFETY: the state and native samples remain live for this direct
+        // trampoline fixture invocation.
+        assert!(unsafe { emit_stream_chunk(&state, native.as_ptr(), native.len() as i32) });
+        native.fill(1.0);
+        assert!(unsafe { emit_stream_chunk(&state, native.as_ptr(), native.len() as i32) });
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(chunks[0].samples, [0.25, -0.5]);
+        assert_eq!(chunks[1].samples, [1.0, 1.0]);
+        assert_eq!(chunks[0].sample_rate, QWEN_SAMPLE_RATE);
+        drop(chunks);
+        assert!(state.error().is_none());
+
+        let cancelled = StreamCallbackState::new(|_: StreamChunk| StreamControl::Cancel);
+        assert!(!unsafe { emit_stream_chunk(&cancelled, native.as_ptr(), native.len() as i32) });
+        assert!(matches!(
+            cancelled.error(),
+            Some(QwenTtsError::StreamCancelled)
+        ));
+
+        let panicked =
+            StreamCallbackState::new(|_: StreamChunk| -> StreamControl { panic!("fixture panic") });
+        assert!(!unsafe { emit_stream_chunk(&panicked, native.as_ptr(), native.len() as i32) });
+        assert!(matches!(
+            panicked.error(),
+            Some(QwenTtsError::StreamCallbackPanicked)
+        ));
+
+        let invalid = StreamCallbackState::new(|_: StreamChunk| StreamControl::Continue);
+        assert!(!unsafe { emit_stream_chunk(&invalid, std::ptr::null(), 1) });
+        assert!(matches!(
+            invalid.error(),
+            Some(QwenTtsError::InvalidStreamChunk)
+        ));
+    }
 
     fn emit_test_log(level: raw::qt_log_level, message: &[u8]) {
         let message = CString::new(message).unwrap();
@@ -602,6 +824,52 @@ mod tests {
             QwenTtsEngine::new().synthesize("hello", None),
             Err(QwenTtsError::ModelNotLoaded { .. })
         ));
+        assert!(matches!(
+            QwenTtsEngine::new()
+                .synthesize_streaming("hello", None, |_: StreamChunk| StreamControl::Continue,),
+            Err(QwenTtsError::ModelNotLoaded { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_synthesis_options_forward_every_sampling_field() {
+        let sampling = SamplingOptions {
+            seed: Some(42),
+            max_new_tokens: 123,
+            temperature: 0.4,
+            top_k: 17,
+            top_p: 0.8,
+            repetition_penalty: 1.2,
+        };
+        with_synthesis_params(
+            "hello",
+            Some(SynthesisOptions {
+                language: Language::German,
+                sampling,
+                voice: Voice::Named("speaker-a"),
+            }),
+            |params| {
+                // SAFETY: with_synthesis_params keeps all C strings alive for
+                // this closure invocation.
+                unsafe {
+                    assert_eq!(CStr::from_ptr(params.text).to_str().unwrap(), "hello");
+                    assert_eq!(CStr::from_ptr(params.lang).to_str().unwrap(), "german");
+                    assert_eq!(
+                        CStr::from_ptr(params.speaker).to_str().unwrap(),
+                        "speaker-a"
+                    );
+                }
+                assert_eq!(params.seed, 42);
+                assert_eq!(params.max_new_tokens, 123);
+                assert_eq!(params.temperature, 0.4);
+                assert_eq!(params.top_k, 17);
+                assert_eq!(params.top_p, 0.8);
+                assert_eq!(params.repetition_penalty, 1.2);
+                assert!(params.on_chunk.is_none());
+                Ok(())
+            },
+        )
+        .unwrap();
     }
 
     #[test]

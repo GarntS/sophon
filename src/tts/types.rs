@@ -22,6 +22,19 @@ pub struct TtsRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtsStreamControl {
+    Continue,
+    Cancel,
+}
+
+#[derive(Debug)]
+pub enum TtsStreamEvent {
+    Format { sample_rate: u32 },
+    Chunk { samples: Vec<f32> },
+    Terminal(Result<(), crate::error::SophonError>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TtsCapabilities {
     pub named_voices: bool,
     pub voice_cloning: bool,

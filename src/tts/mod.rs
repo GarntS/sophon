@@ -5,7 +5,7 @@ pub mod service;
 pub mod types;
 
 pub use service::TtsService;
-pub use types::{TtsCapabilities, TtsRequest, VoiceIntent};
+pub use types::{TtsCapabilities, TtsRequest, TtsStreamControl, TtsStreamEvent, VoiceIntent};
 
 use std::{
     path::{Path, PathBuf},
@@ -29,7 +29,8 @@ use crate::{
 #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
 use qwentts_cpp::{
     Language as QwenLanguage, QwenTtsEngine, SamplingOptions as QwenSamplingOptions,
-    Voice as QwenVoice, VoiceReference as QwenVoiceReference,
+    StreamChunk as QwenStreamChunk, StreamControl as QwenStreamControl, Voice as QwenVoice,
+    VoiceReference as QwenVoiceReference,
 };
 
 pub trait TtsProvider: Send {
@@ -38,6 +39,20 @@ pub trait TtsProvider: Send {
     fn capabilities(&self) -> TtsCapabilities;
     fn voices(&self) -> &[String];
     fn synthesize(&mut self, request: &TtsRequest) -> Result<OwnedAudio, SophonError>;
+
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        _request: &TtsRequest,
+        _emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        Err(SophonError::UnsupportedCapability(
+            "provider does not support streaming synthesis".into(),
+        ))
+    }
 }
 
 pub struct KokoroProvider {
@@ -248,6 +263,39 @@ impl QwenEngineAdapter {
             sample_rate: result.sample_rate,
         })
     }
+
+    pub fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        voice: QwenVoice<'_>,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        if emit(TtsStreamEvent::Format {
+            sample_rate: 24_000,
+        }) == TtsStreamControl::Cancel
+        {
+            return Err(SophonError::SynthesisFailed(
+                "streaming synthesis was cancelled before generation".into(),
+            ));
+        }
+        self.engine
+            .synthesize_streaming(
+                text,
+                Some(qwentts_cpp::SynthesisOptions {
+                    language,
+                    sampling: self.sampling.clone(),
+                    voice,
+                }),
+                |chunk: QwenStreamChunk| match emit(TtsStreamEvent::Chunk {
+                    samples: chunk.samples,
+                }) {
+                    TtsStreamControl::Continue => QwenStreamControl::Continue,
+                    TtsStreamControl::Cancel => QwenStreamControl::Cancel,
+                },
+            )
+            .map_err(|error| SophonError::SynthesisFailed(error.to_string()))
+    }
 }
 
 #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
@@ -277,6 +325,51 @@ trait QwenProviderEngine: Send {
         samples_24khz_mono: &[f32],
         transcript: Option<&str>,
     ) -> Result<OwnedAudio, SophonError>;
+
+    fn stream_default(
+        &mut self,
+        _text: &str,
+        _language: QwenLanguage,
+        _emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        Err(SophonError::SynthesisFailed(
+            "fixture engine does not implement streaming".into(),
+        ))
+    }
+    fn stream_named(
+        &mut self,
+        _text: &str,
+        _language: QwenLanguage,
+        _speaker: &str,
+        _emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        Err(SophonError::SynthesisFailed(
+            "fixture engine does not implement streaming".into(),
+        ))
+    }
+    fn stream_design(
+        &mut self,
+        _text: &str,
+        _language: QwenLanguage,
+        _description: &str,
+        _emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        Err(SophonError::SynthesisFailed(
+            "fixture engine does not implement streaming".into(),
+        ))
+    }
+    fn stream_clone(
+        &mut self,
+        _text: &str,
+        _language: QwenLanguage,
+        _samples_24khz_mono: &[f32],
+        _transcript: Option<&str>,
+        _emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        Err(SophonError::SynthesisFailed(
+            "fixture engine does not implement streaming".into(),
+        ))
+    }
 }
 
 #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
@@ -327,6 +420,54 @@ impl QwenProviderEngine for QwenEngineAdapter {
             None => QwenVoice::Clone(&reference),
         };
         self.synthesize(text, language, voice)
+    }
+
+    fn stream_default(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        self.synthesize_streaming(text, language, QwenVoice::Default, emit)
+    }
+
+    fn stream_named(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        speaker: &str,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        self.synthesize_streaming(text, language, QwenVoice::Named(speaker), emit)
+    }
+
+    fn stream_design(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        description: &str,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        self.synthesize_streaming(text, language, QwenVoice::Design(description), emit)
+    }
+
+    fn stream_clone(
+        &mut self,
+        text: &str,
+        language: QwenLanguage,
+        samples_24khz_mono: &[f32],
+        transcript: Option<&str>,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        let reference = self.extract_voice_reference(samples_24khz_mono)?;
+        let voice = match transcript {
+            Some(transcript) => QwenVoice::CloneWithTranscript {
+                reference: &reference,
+                transcript,
+            },
+            None => QwenVoice::Clone(&reference),
+        };
+        self.synthesize_streaming(text, language, voice, emit)
     }
 }
 
@@ -443,6 +584,32 @@ impl TtsProvider for QwenTtsCustomVoiceProvider {
         self.engine
             .synthesize_named(&request.text, language, speaker)
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        request: &TtsRequest,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        validate_capabilities(self, request)?;
+        validate_qwen_text_like(&request.text, "synthesis text", self.max_text_bytes)?;
+        if request.speed != 1.0 {
+            return Err(SophonError::InvalidTtsOptions(
+                "Qwen TTS supports only unit speed".into(),
+            ));
+        }
+        let language = normalize_qwen_language(request.language.as_deref())?;
+        let speaker = match &request.voice {
+            VoiceIntent::Default => &self.default_voice,
+            VoiceIntent::Named(speaker) => speaker,
+            VoiceIntent::Clone { .. } | VoiceIntent::Design(_) => unreachable!("validated above"),
+        };
+        self.engine
+            .stream_named(&request.text, language, speaker, emit)
+    }
 }
 
 #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
@@ -525,6 +692,33 @@ impl TtsProvider for QwenTtsVoiceDesignProvider {
         self.engine
             .synthesize_design(&request.text, language, description)
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        request: &TtsRequest,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        validate_capabilities(self, request)?;
+        if request.speed != 1.0 {
+            return Err(SophonError::InvalidTtsOptions(
+                "Qwen TTS supports only unit speed".into(),
+            ));
+        }
+        validate_qwen_text_like(&request.text, "synthesis text", self.max_text_bytes)?;
+        let language = normalize_qwen_language(request.language.as_deref())?;
+        let description = match &request.voice {
+            VoiceIntent::Default => &self.default_voice_description,
+            VoiceIntent::Design(description) => description,
+            VoiceIntent::Named(_) | VoiceIntent::Clone { .. } => unreachable!("validated above"),
+        };
+        validate_qwen_text_like(description, "voice description", self.max_text_bytes)?;
+        self.engine
+            .stream_design(&request.text, language, description, emit)
+    }
 }
 
 #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
@@ -578,6 +772,49 @@ impl TtsProvider for QwenTtsBaseProvider {
                     language,
                     &reference.samples,
                     transcript.as_deref(),
+                )
+            }
+            VoiceIntent::Named(_) | VoiceIntent::Design(_) => unreachable!("validated above"),
+        }
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        request: &TtsRequest,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        validate_capabilities(self, request)?;
+        if request.speed != 1.0 {
+            return Err(SophonError::InvalidTtsOptions(
+                "Qwen TTS supports only unit speed".into(),
+            ));
+        }
+        validate_qwen_text_like(&request.text, "synthesis text", self.max_text_bytes)?;
+        let language = normalize_qwen_language(request.language.as_deref())?;
+        match &request.voice {
+            VoiceIntent::Default => self.engine.stream_default(&request.text, language, emit),
+            VoiceIntent::Clone {
+                reference,
+                transcript,
+            } => {
+                if let Some(transcript) = transcript {
+                    validate_qwen_text_like(transcript, "clone transcript", self.max_text_bytes)?;
+                }
+                if reference.sample_rate != 24_000 {
+                    return Err(SophonError::InvalidTtsOptions(
+                        "Qwen clone references must be 24 kHz mono PCM".into(),
+                    ));
+                }
+                self.engine.stream_clone(
+                    &request.text,
+                    language,
+                    &reference.samples,
+                    transcript.as_deref(),
+                    emit,
                 )
             }
             VoiceIntent::Named(_) | VoiceIntent::Design(_) => unreachable!("validated above"),
@@ -759,9 +996,65 @@ impl TtsProvider for KokoroProvider {
     }
 }
 
-struct TtsWorkItem {
-    request: TtsRequest,
-    response: oneshot::Sender<Result<OwnedAudio, SophonError>>,
+enum TtsWorkItem {
+    Buffered {
+        request: TtsRequest,
+        response: oneshot::Sender<Result<OwnedAudio, SophonError>>,
+    },
+    Streaming {
+        request: TtsRequest,
+        events: tokio::sync::mpsc::UnboundedSender<TtsStreamEvent>,
+    },
+}
+
+pub struct TtsStream {
+    events: tokio::sync::mpsc::UnboundedReceiver<TtsStreamEvent>,
+}
+
+impl TtsStream {
+    pub async fn next(&mut self) -> Option<TtsStreamEvent> {
+        self.events.recv().await
+    }
+
+    pub fn blocking_next(&mut self) -> Option<TtsStreamEvent> {
+        self.events.blocking_recv()
+    }
+
+    pub(crate) fn try_next(
+        &mut self,
+    ) -> Result<TtsStreamEvent, tokio::sync::mpsc::error::TryRecvError> {
+        self.events.try_recv()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_receiver(
+        events: tokio::sync::mpsc::UnboundedReceiver<TtsStreamEvent>,
+    ) -> Self {
+        Self { events }
+    }
+}
+
+fn validate_generated_audio(
+    audio: OwnedAudio,
+    max_generated_audio_seconds: u64,
+) -> Result<OwnedAudio, SophonError> {
+    if audio.sample_rate == 0 {
+        return Err(SophonError::SynthesisFailed(
+            "provider returned a zero sample rate".into(),
+        ));
+    }
+    if audio.samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(SophonError::SynthesisFailed(
+            "provider returned a non-finite audio sample".into(),
+        ));
+    }
+    let maximum_frames = u128::from(audio.sample_rate) * u128::from(max_generated_audio_seconds);
+    if audio.samples.len() as u128 > maximum_frames {
+        return Err(SophonError::ResourceLimit(format!(
+            "generated audio exceeds {max_generated_audio_seconds} seconds"
+        )));
+    }
+    Ok(audio)
 }
 
 #[derive(Clone)]
@@ -788,22 +1081,122 @@ impl TtsWorker {
             .name("sophon-tts-worker".into())
             .spawn(move || {
                 while let Ok(work) = receiver.recv() {
-                    let result = provider.synthesize(&work.request).and_then(|audio| {
-                        if audio.sample_rate == 0 {
-                            return Err(SophonError::SynthesisFailed(
-                                "provider returned a zero sample rate".into(),
-                            ));
+                    match work {
+                        TtsWorkItem::Buffered { request, response } => {
+                            let result = provider
+                                .synthesize(&request)
+                                .and_then(|audio| {
+                                    validate_generated_audio(
+                                        audio,
+                                        max_generated_audio_seconds,
+                                    )
+                                });
+                            let _ = response.send(result);
                         }
-                        let maximum_frames =
-                            u128::from(audio.sample_rate) * u128::from(max_generated_audio_seconds);
-                        if audio.samples.len() as u128 > maximum_frames {
-                            return Err(SophonError::ResourceLimit(format!(
-                                "generated audio exceeds {max_generated_audio_seconds} seconds"
-                            )));
+                        TtsWorkItem::Streaming { request, events } => {
+                            let result = if provider.supports_streaming() {
+                                let mut sample_rate = None;
+                                let mut accepted_samples = 0_u128;
+                                let mut callback_failure = None;
+                                let provider_result = {
+                                    let mut emit = |event| {
+                                    if callback_failure.is_some() {
+                                        return TtsStreamControl::Cancel;
+                                    }
+                                    match &event {
+                                        TtsStreamEvent::Format { sample_rate: rate } => {
+                                            if *rate == 0 || sample_rate.replace(*rate).is_some() {
+                                                callback_failure = Some(SophonError::SynthesisFailed(
+                                                    "provider emitted an invalid stream format".into(),
+                                                ));
+                                                return TtsStreamControl::Cancel;
+                                            }
+                                        }
+                                        TtsStreamEvent::Chunk { samples } => {
+                                            let Some(rate) = sample_rate else {
+                                                callback_failure = Some(SophonError::SynthesisFailed(
+                                                    "provider emitted audio before its stream format".into(),
+                                                ));
+                                                return TtsStreamControl::Cancel;
+                                            };
+                                            if samples.is_empty() {
+                                                return TtsStreamControl::Continue;
+                                            }
+                                            if samples.iter().any(|sample| !sample.is_finite()) {
+                                                callback_failure = Some(SophonError::SynthesisFailed(
+                                                    "provider emitted a non-finite audio sample".into(),
+                                                ));
+                                                return TtsStreamControl::Cancel;
+                                            }
+                                            accepted_samples += samples.len() as u128;
+                                            if accepted_samples
+                                                > u128::from(rate)
+                                                    * u128::from(max_generated_audio_seconds)
+                                            {
+                                                callback_failure = Some(SophonError::ResourceLimit(
+                                                    format!(
+                                                        "generated audio exceeds {max_generated_audio_seconds} seconds"
+                                                    ),
+                                                ));
+                                                return TtsStreamControl::Cancel;
+                                            }
+                                        }
+                                        TtsStreamEvent::Terminal(_) => {
+                                            callback_failure = Some(SophonError::SynthesisFailed(
+                                                "provider emitted a reserved terminal event".into(),
+                                            ));
+                                            return TtsStreamControl::Cancel;
+                                        }
+                                    }
+                                    if events.send(event).is_err() {
+                                        callback_failure = Some(SophonError::SynthesisFailed(
+                                            "streaming synthesis consumer cancelled".into(),
+                                        ));
+                                        TtsStreamControl::Cancel
+                                    } else {
+                                        TtsStreamControl::Continue
+                                    }
+                                    };
+                                    provider.synthesize_streaming(&request, &mut emit)
+                                };
+                                callback_failure.map_or(provider_result, Err).and_then(|()| {
+                                    if sample_rate.is_none() || accepted_samples == 0 {
+                                        Err(SophonError::SynthesisFailed(
+                                            "provider returned no streamed audio".into(),
+                                        ))
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
+                            } else {
+                                provider
+                                    .synthesize(&request)
+                                    .and_then(|audio| {
+                                        validate_generated_audio(
+                                            audio,
+                                            max_generated_audio_seconds,
+                                        )
+                                    })
+                                    .and_then(|audio| {
+                                        events
+                                            .send(TtsStreamEvent::Format {
+                                                sample_rate: audio.sample_rate,
+                                            })
+                                            .and_then(|()| {
+                                                events.send(TtsStreamEvent::Chunk {
+                                                    samples: audio.samples,
+                                                })
+                                            })
+                                            .map_err(|_| {
+                                                SophonError::SynthesisFailed(
+                                                    "streaming synthesis consumer cancelled".into(),
+                                                )
+                                            })
+                                    })
+                            };
+                            let _ = events.send(TtsStreamEvent::Terminal(result));
                         }
-                        Ok(audio)
-                    });
-                    let _ = work.response.send(result);
+                    }
                 }
             })
             .expect("failed to create TTS worker");
@@ -834,10 +1227,29 @@ impl TtsWorker {
 
     pub async fn synthesize(&self, request: TtsRequest) -> Result<OwnedAudio, SophonError> {
         let (response, receiver) = oneshot::channel();
-        match self.sender.try_send(TtsWorkItem { request, response }) {
+        match self
+            .sender
+            .try_send(TtsWorkItem::Buffered { request, response })
+        {
             Ok(()) => receiver
                 .await
                 .map_err(|_| SophonError::SynthesisFailed("TTS worker stopped".into()))?,
+            Err(TrySendError::Full(_)) => Err(SophonError::ResourceLimit(
+                "TTS inference queue is full".into(),
+            )),
+            Err(TrySendError::Disconnected(_)) => Err(SophonError::ModelUnavailable(
+                "TTS worker is unavailable".into(),
+            )),
+        }
+    }
+
+    pub fn synthesize_streaming(&self, request: TtsRequest) -> Result<TtsStream, SophonError> {
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        match self
+            .sender
+            .try_send(TtsWorkItem::Streaming { request, events })
+        {
+            Ok(()) => Ok(TtsStream { events: receiver }),
             Err(TrySendError::Full(_)) => Err(SophonError::ResourceLimit(
                 "TTS inference queue is full".into(),
             )),
@@ -882,7 +1294,10 @@ pub fn validate_capabilities(
 mod tests {
     use super::*;
     use std::{
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
@@ -914,6 +1329,24 @@ mod tests {
                 samples: vec![0.25],
                 sample_rate: 24_000,
             })
+        }
+
+        fn stream(
+            &mut self,
+            call: QwenCall,
+            emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+        ) -> Result<(), SophonError> {
+            self.calls.lock().unwrap().push(call);
+            if emit(TtsStreamEvent::Format {
+                sample_rate: 24_000,
+            }) == TtsStreamControl::Cancel
+                || emit(TtsStreamEvent::Chunk {
+                    samples: vec![0.25],
+                }) == TtsStreamControl::Cancel
+            {
+                return Err(SophonError::SynthesisFailed("fixture cancelled".into()));
+            }
+            Ok(())
         }
     }
 
@@ -962,6 +1395,49 @@ mod tests {
                 transcript.map(str::to_owned),
             ))
         }
+
+        fn stream_default(
+            &mut self,
+            _: &str,
+            language: QwenLanguage,
+            emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+        ) -> Result<(), SophonError> {
+            self.stream(QwenCall::Default(language), emit)
+        }
+
+        fn stream_named(
+            &mut self,
+            _: &str,
+            language: QwenLanguage,
+            speaker: &str,
+            emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+        ) -> Result<(), SophonError> {
+            self.stream(QwenCall::Named(language, speaker.into()), emit)
+        }
+
+        fn stream_design(
+            &mut self,
+            _: &str,
+            language: QwenLanguage,
+            description: &str,
+            emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+        ) -> Result<(), SophonError> {
+            self.stream(QwenCall::Design(language, description.into()), emit)
+        }
+
+        fn stream_clone(
+            &mut self,
+            _: &str,
+            language: QwenLanguage,
+            samples: &[f32],
+            transcript: Option<&str>,
+            emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+        ) -> Result<(), SophonError> {
+            self.stream(
+                QwenCall::Clone(language, samples.to_vec(), transcript.map(str::to_owned)),
+                emit,
+            )
+        }
     }
 
     struct FixtureProvider {
@@ -1002,6 +1478,91 @@ mod tests {
                 sample_rate: 10,
             })
         }
+    }
+
+    struct StreamingFixtureProvider {
+        buffered_calls: Arc<Mutex<Vec<String>>>,
+        streaming_calls: Arc<Mutex<Vec<String>>>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl TtsProvider for StreamingFixtureProvider {
+        fn provider_id(&self) -> &'static str {
+            "streaming-fixture"
+        }
+
+        fn model_id(&self) -> &str {
+            "streaming-fixture-model"
+        }
+
+        fn capabilities(&self) -> TtsCapabilities {
+            capabilities()
+        }
+
+        fn voices(&self) -> &[String] {
+            &[]
+        }
+
+        fn synthesize(&mut self, request: &TtsRequest) -> Result<OwnedAudio, SophonError> {
+            self.buffered_calls
+                .lock()
+                .unwrap()
+                .push(request.text.clone());
+            Ok(OwnedAudio {
+                samples: vec![9.0],
+                sample_rate: 10,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn synthesize_streaming(
+            &mut self,
+            request: &TtsRequest,
+            emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+        ) -> Result<(), SophonError> {
+            self.streaming_calls
+                .lock()
+                .unwrap()
+                .push(request.text.clone());
+            for event in [
+                TtsStreamEvent::Format { sample_rate: 10 },
+                TtsStreamEvent::Chunk { samples: vec![1.0] },
+            ] {
+                if emit(event) == TtsStreamControl::Cancel {
+                    self.cancelled.store(true, Ordering::Release);
+                    return Err(SophonError::SynthesisFailed("fixture cancelled".into()));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            if request.text == "fail" {
+                return Err(SophonError::SynthesisFailed("fixture failure".into()));
+            }
+            let samples = if request.text == "overflow" {
+                vec![2.0; 10]
+            } else {
+                vec![2.0]
+            };
+            if emit(TtsStreamEvent::Chunk { samples }) == TtsStreamControl::Cancel {
+                self.cancelled.store(true, Ordering::Release);
+                return Err(SophonError::SynthesisFailed("fixture cancelled".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn streaming_fixture(
+        buffered_calls: Arc<Mutex<Vec<String>>>,
+        streaming_calls: Arc<Mutex<Vec<String>>>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Box<dyn TtsProvider> {
+        Box::new(StreamingFixtureProvider {
+            buffered_calls,
+            streaming_calls,
+            cancelled,
+        })
     }
 
     fn capabilities() -> TtsCapabilities {
@@ -1073,6 +1634,7 @@ mod tests {
         assert_eq!(provider.provider_id(), "qwentts-cpp");
         assert!(provider.capabilities().voice_cloning);
         assert!(!provider.capabilities().named_voices);
+        assert!(provider.supports_streaming());
         assert!(
             provider
                 .synthesize(&TtsRequest {
@@ -1110,6 +1672,24 @@ mod tests {
                 ),
             ]
         );
+        let mut emit = |_: TtsStreamEvent| TtsStreamControl::Continue;
+        provider
+            .synthesize_streaming(
+                &TtsRequest {
+                    text: "stream clone".into(),
+                    language: Some("en".into()),
+                    speed: 1.0,
+                    voice: VoiceIntent::Clone {
+                        reference: OwnedAudio {
+                            samples: vec![0.2],
+                            sample_rate: 24_000,
+                        },
+                        transcript: None,
+                    },
+                },
+                &mut emit,
+            )
+            .unwrap();
         assert!(matches!(
             provider.synthesize(&TtsRequest {
                 text: "bad speed".into(),
@@ -1148,6 +1728,7 @@ mod tests {
         .unwrap();
         assert_eq!(provider.voices(), ["vivian", "ryan"]);
         assert!(provider.capabilities().named_voices);
+        assert!(provider.supports_streaming());
         for voice in [VoiceIntent::Default, VoiceIntent::Named("ryan".into())] {
             provider
                 .synthesize(&TtsRequest {
@@ -1165,6 +1746,18 @@ mod tests {
                 QwenCall::Named(QwenLanguage::Chinese, "ryan".into()),
             ]
         );
+        let mut emit = |_: TtsStreamEvent| TtsStreamControl::Continue;
+        provider
+            .synthesize_streaming(
+                &TtsRequest {
+                    text: "stream named".into(),
+                    language: None,
+                    speed: 1.0,
+                    voice: VoiceIntent::Named("ryan".into()),
+                },
+                &mut emit,
+            )
+            .unwrap();
         assert!(matches!(
             provider.synthesize(&TtsRequest {
                 text: "hello".into(),
@@ -1191,6 +1784,7 @@ mod tests {
             1024,
         );
         assert!(provider.capabilities().voice_design);
+        assert!(provider.supports_streaming());
         for voice in [
             VoiceIntent::Default,
             VoiceIntent::Design("bright override".into()),
@@ -1211,6 +1805,18 @@ mod tests {
                 QwenCall::Design(QwenLanguage::Italian, "bright override".into()),
             ]
         );
+        let mut emit = |_: TtsStreamEvent| TtsStreamControl::Continue;
+        provider
+            .synthesize_streaming(
+                &TtsRequest {
+                    text: "stream design".into(),
+                    language: None,
+                    speed: 1.0,
+                    voice: VoiceIntent::Design("soft".into()),
+                },
+                &mut emit,
+            )
+            .unwrap();
     }
 
     #[cfg(any(feature = "qwen-cpu", feature = "qwen-cuda", feature = "qwen-vulkan"))]
@@ -1425,6 +2031,125 @@ mod tests {
                 third_request
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn worker_streams_early_and_preserves_buffered_and_fallback_routing() {
+        let buffered_calls = Arc::new(Mutex::new(Vec::new()));
+        let streaming_calls = Arc::new(Mutex::new(Vec::new()));
+        let worker = TtsWorker::new(
+            streaming_fixture(
+                buffered_calls.clone(),
+                streaming_calls.clone(),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            2,
+            1,
+        );
+
+        let buffered = worker
+            .synthesize(request("buffered", VoiceIntent::Default))
+            .await
+            .unwrap();
+        assert_eq!(buffered.samples, [9.0]);
+        assert_eq!(*buffered_calls.lock().unwrap(), ["buffered"]);
+        assert!(streaming_calls.lock().unwrap().is_empty());
+
+        let mut stream = worker
+            .synthesize_streaming(request("streamed", VoiceIntent::Default))
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(TtsStreamEvent::Format { sample_rate: 10 })
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(TtsStreamEvent::Chunk { samples }) if samples == [1.0]
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), stream.next())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(TtsStreamEvent::Chunk { samples }) if samples == [2.0]
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(TtsStreamEvent::Terminal(Ok(())))
+        ));
+        assert_eq!(*streaming_calls.lock().unwrap(), ["streamed"]);
+
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback = TtsWorker::new(fixture(fallback_calls.clone(), false), 1, 1);
+        let mut stream = fallback
+            .synthesize_streaming(request("fallback", VoiceIntent::Default))
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(TtsStreamEvent::Format { sample_rate: 10 })
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(TtsStreamEvent::Chunk { samples }) if samples == [1.25]
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(TtsStreamEvent::Terminal(Ok(())))
+        ));
+        assert_eq!(fallback_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_cancels_overflow_or_dropped_consumers_and_recovers() {
+        let buffered_calls = Arc::new(Mutex::new(Vec::new()));
+        let streaming_calls = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker = TtsWorker::new(
+            streaming_fixture(buffered_calls.clone(), streaming_calls, cancelled.clone()),
+            2,
+            1,
+        );
+
+        let mut overflow = worker
+            .synthesize_streaming(request("overflow", VoiceIntent::Default))
+            .unwrap();
+        loop {
+            if let Some(TtsStreamEvent::Terminal(result)) = overflow.next().await {
+                assert!(matches!(result, Err(SophonError::ResourceLimit(_))));
+                break;
+            }
+        }
+        assert!(cancelled.load(Ordering::Acquire));
+        cancelled.store(false, Ordering::Release);
+
+        let mut failed = worker
+            .synthesize_streaming(request("fail", VoiceIntent::Default))
+            .unwrap();
+        loop {
+            if let Some(TtsStreamEvent::Terminal(result)) = failed.next().await {
+                assert!(matches!(result, Err(SophonError::SynthesisFailed(_))));
+                break;
+            }
+        }
+
+        let mut dropped = worker
+            .synthesize_streaming(request("cancel", VoiceIntent::Default))
+            .unwrap();
+        let _ = dropped.next().await;
+        let _ = dropped.next().await;
+        drop(dropped);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(cancelled.load(Ordering::Acquire));
+
+        assert!(
+            worker
+                .synthesize(request("recovered", VoiceIntent::Default))
+                .await
+                .is_ok()
+        );
+        assert_eq!(*buffered_calls.lock().unwrap(), ["recovered"]);
     }
 
     #[tokio::test]

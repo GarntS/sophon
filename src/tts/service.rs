@@ -17,6 +17,7 @@ pub struct TtsService {
     playback: PlaybackWorker,
     config: TtsConfig,
     supported_languages: Vec<String>,
+    aloud: tokio::sync::Mutex<()>,
 }
 
 impl TtsService {
@@ -31,6 +32,7 @@ impl TtsService {
             playback,
             config,
             supported_languages,
+            aloud: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -90,11 +92,15 @@ impl TtsService {
     }
 
     pub async fn speak_aloud(&self, request: TtsRequest) -> Result<(), SophonError> {
-        let audio = self.synthesize(request).await?;
+        self.validate_language(&request)?;
+        // Tokio's mutex is FIFO, so the serialized stage covers both provider
+        // generation and playback without blocking an async executor thread.
+        let _aloud = self.aloud.lock().await;
+        let stream = self.worker.synthesize_streaming(request)?;
         self.playback
             .play(PlaybackRequest {
-                audio,
-                node_name: self.config.operational.pipewire_node.clone(),
+                stream,
+                output_device: self.config.operational.output_device.clone(),
                 volume: self.config.operational.volume as f32,
             })
             .await

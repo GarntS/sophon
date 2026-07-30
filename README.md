@@ -1,6 +1,6 @@
 # Sophon
 
-Sophon is a headless session D-Bus speech-to-text (STT) and text-to-speech (TTS) service. It performs local inference and exchanges complete audio through files, transferred descriptors, or PipeWire playback.
+Sophon is a headless session D-Bus speech-to-text (STT) and text-to-speech (TTS) service. It performs local inference, exchanges complete audio through files or transferred descriptors, and streams aloud speech through CPAL's PipeWire backend.
 
 STT uses [`transcribe-rs`](https://github.com/cjpais/transcribe-rs.git) with Parakeet or Canary on CPU, CUDA, or AMD MIGraphX ONNX Runtime packages. TTS produces mono 24 kHz float PCM using either Kokoro from `tts-rs` or curated Qwen3-TTS Base, CustomVoice, and VoiceDesign models through `qwentts-cpp`.
 
@@ -20,7 +20,7 @@ nix profile install .#sophon-migraphx  # ONNX MIGraphX + Qwen Vulkan
 | `sophon-cuda` | ONNX Runtime CUDA | GGML CUDA | compatible NVIDIA driver/CUDA device |
 | `sophon-migraphx` | ONNX Runtime MIGraphX | GGML Vulkan | compatible AMD ROCm/MIGraphX stack plus a Vulkan loader and device |
 
-Each output includes `libqwen`, common GGML libraries, its selected GGML backend, and relocatable runtime search paths. Accelerator packages retain CPU fallback libraries but do not include the unrelated Qwen accelerator. The runtime closure also includes PipeWire and `espeak-ng`, which Kokoro uses for phonemization.
+Each output includes `libqwen`, common GGML libraries, its selected GGML backend, and relocatable runtime search paths. Accelerator packages retain CPU fallback libraries but do not include the unrelated Qwen accelerator. Sophon uses CPAL rather than the PipeWire API directly; CPAL's backend still requires the PipeWire and ALSA system libraries in the runtime/build environment. The closure also includes `espeak-ng`, which Kokoro uses for phonemization.
 
 ### Validation
 
@@ -70,7 +70,7 @@ tts:
   model_id: kokoro-v1.0-int8
   default_voice: af_heart
   default_speed: 1.0 # finite, 0.5 through 2.0
-  # pipewire_node: alsa_output.example # exact stable node.name
+  # output_device: pipewire:alsa_output.example # canonical CPAL DeviceId
   volume: 1.0 # finite linear gain, 0.0 through 1.0
   max_text_bytes: 16384
   max_reference_audio_bytes: 33554432
@@ -218,7 +218,7 @@ Clients should use a timeout appropriate for local model inference plus complete
 
 ### STT input
 
-STT accepts complete RIFF/WAVE data containing mono 16 kHz signed 16-bit PCM. File paths must be absolute regular files. Transferred descriptors must be readable and seekable from byte zero; they need not be memfds.
+STT accepts complete RIFF/WAVE data with one or more channels of Hound-supported 8-, 16-, 24-, or 32-bit integer PCM or 32-bit IEEE-float PCM. Integer samples are normalized to finite `f32`; multichannel frames are averaged to mono. The result is resampled with Rubato only when its source rate differs from the active model's advertised input rate. Equal-rate input bypasses resampling exactly. File paths must be absolute regular files. Transferred descriptors must be readable and seekable from byte zero; they need not be memfds. Encoded size, source duration, and normalized model-input duration are all bounded.
 
 ### TTS output
 
@@ -228,11 +228,15 @@ File and buffer synthesis returns complete mono RIFF/WAVE with the provider samp
 
 Clone descriptors must be readable and seekable from byte zero and contain complete mono 24 kHz 32-bit IEEE-float WAV data. Sophon does not resample or remix references. Encoded-byte and decoded-duration limits are checked before synthesis. The initial Kokoro provider rejects otherwise valid cloning as unsupported.
 
-Text bytes, reference bytes/duration, generated duration, inference queue depth, and playback queue depth are bounded by configuration. A full queue or exceeded bound returns `ResourceLimit`.
+Text bytes, reference bytes/duration, generated duration, inference queue depth, and streamed playback samples are bounded by configuration. A full queue or exceeded bound returns `ResourceLimit`. STT normalization never changes TTS output, aloud samples, or clone references.
 
-## PipeWire playback
+## CPAL PipeWire playback
 
-Without `tts.pipewire_node`, Sophon asks PipeWire for its current default audio sink. When a node is configured, Sophon resolves that exact stable `node.name`; a missing node returns `PlaybackFailed` and never falls back to another sink. Configured volume is a linear multiplier applied only to playback, not file or memfd output. `0.0` performs normal silent playback.
+Without `tts.output_device`, Sophon lazily asks CPAL's explicit PipeWire host for its current default output device on each aloud call. A configured value must be a canonical `pipewire:<node.name>` CPAL `DeviceId`; Sophon resolves that exact device and never falls back when it is missing. Migrate `pipewire_node: X` to `output_device: pipewire:X`; the removed legacy field is rejected at startup.
+
+Playback opens an `f32` stream at the provider's native rate and duplicates volume-scaled mono samples across device channels. Sophon does not resample TTS output; an unsupported native rate returns `PlaybackFailed`. Configured volume affects only playback, not file or memfd output, and `0.0` performs normal silent playback.
+
+Qwen `SpeakAloud` begins with its first native chunk, before synthesis completes. Kokoro and other non-streaming providers begin after their complete buffered result is available. There is no startup prebuffer: temporary producer underruns produce silence, and later chunks resume in order. Aloud calls remain FIFO and non-overlapping. If synthesis, a resource limit, or playback fails after audio has started, the call still returns the stable error, unplayed audio is discarded, and already-audible partial speech cannot be recalled.
 
 A controlled development smoke harness is available inside `nix develop`:
 
@@ -240,7 +244,7 @@ A controlled development smoke harness is available inside `nix develop`:
 tests/pipewire-smoke.sh
 ```
 
-It starts an isolated PipeWire daemon, creates an exact-name null sink, negotiates mono float audio, and waits for complete stream drain.
+It starts an isolated PipeWire daemon and WirePlumber session manager, creates an exact-name null sink, and verifies CPAL default and exact-device selection, provider-native 24 kHz `f32` opening, and complete stream drain.
 
 ## Benchmarks
 
@@ -261,7 +265,7 @@ The first post-ready inference in each STT/TTS sweep is recorded separately. Eve
 
 ### STT corpus
 
-`--wav-dir` supplies the audio corpus directly. Files must be 16 kHz mono 16-bit PCM WAV (the daemon's own input constraint); violating files are rejected with a message naming the constraint, and accepted files must span at least three duration buckets. Without `--wav-dir`, the harness synthesizes a corpus through the daemon's own TTS, resamples it to 16 kHz mono with `ffmpeg` or `sox` (whichever is on PATH — an optional runtime detection, never a hard dependency), and caches it under `$XDG_CACHE_HOME/sophon/bench-corpus` for reuse. With neither a corpus nor a way to make one, the STT sweep is skipped with an actionable message; TTS results still stand.
+`--wav-dir` supplies the audio corpus directly. The daemon accepts the supported integer/float WAV formats described above; benchmark inputs must also span at least three duration buckets. Without `--wav-dir`, the harness synthesizes a corpus through the daemon's own TTS, converts it to 16 kHz mono with `ffmpeg` or `sox` (whichever is on PATH, for benchmark comparability rather than a daemon requirement), and caches it under `$XDG_CACHE_HOME/sophon/bench-corpus` for reuse. With neither a corpus nor a way to make one, the STT sweep is skipped with an actionable message; TTS results still stand.
 
 ### Reading the numbers
 

@@ -153,7 +153,7 @@ struct TtsFileConfig {
     default_voice_description: Option<String>,
     sampling: Option<QwenSamplingConfig>,
     default_speed: f64,
-    pipewire_node: Option<String>,
+    output_device: Option<String>,
     volume: f64,
     max_text_bytes: u64,
     max_reference_audio_bytes: u64,
@@ -173,7 +173,7 @@ impl Default for TtsFileConfig {
             default_voice_description: None,
             sampling: None,
             default_speed: DEFAULT_TTS_SPEED,
-            pipewire_node: None,
+            output_device: None,
             volume: DEFAULT_TTS_VOLUME,
             max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
             max_reference_audio_bytes: DEFAULT_MAX_REFERENCE_AUDIO_BYTES,
@@ -188,7 +188,7 @@ impl Default for TtsFileConfig {
 pub struct TtsOperationalConfig {
     pub cache_dir: PathBuf,
     pub default_speed: f64,
-    pub pipewire_node: Option<String>,
+    pub output_device: Option<cpal::DeviceId>,
     pub volume: f64,
     pub max_text_bytes: u64,
     pub max_reference_audio_bytes: u64,
@@ -490,6 +490,12 @@ impl TtsConfig {
                 .map_err(|error| format!("invalid tts configuration: {error}"))?,
             None => TtsFileConfig::default(),
         };
+        let output_device = file
+            .output_device
+            .as_deref()
+            .map(str::parse::<cpal::DeviceId>)
+            .transpose()
+            .map_err(|error| format!("tts.output_device is invalid: {error}"))?;
         let model_id = file
             .model_id
             .unwrap_or_else(|| match file.provider.as_str() {
@@ -588,7 +594,7 @@ impl TtsConfig {
             operational: TtsOperationalConfig {
                 cache_dir: default_cache,
                 default_speed: file.default_speed,
-                pipewire_node: file.pipewire_node,
+                output_device,
                 volume: file.volume,
                 max_text_bytes: file.max_text_bytes,
                 max_reference_audio_bytes: file.max_reference_audio_bytes,
@@ -709,12 +715,16 @@ impl TtsConfig {
                 );
             }
         }
-        if let Some(node) = &operational.pipewire_node
-            && (node.trim().is_empty() || node.chars().any(char::is_control))
-        {
-            return Err(
-                "tts.pipewire_node must be a non-empty node name without control characters".into(),
-            );
+        if let Some(device) = &operational.output_device {
+            if device.host() != cpal::platform::HostId::PipeWire {
+                return Err("tts.output_device must identify the pipewire host".into());
+            }
+            if device.id().trim().is_empty() || device.id().chars().any(char::is_control) {
+                return Err(
+                    "tts.output_device must contain a non-empty backend device identifier without control characters"
+                        .into(),
+                );
+            }
         }
         if !operational.volume.is_finite() || !(0.0..=1.0).contains(&operational.volume) {
             return Err("tts.volume must be finite and between 0.0 and 1.0".into());
@@ -783,6 +793,47 @@ mod tests {
         assert_eq!(tts.provider_id(), DEFAULT_TTS_PROVIDER);
         assert_eq!(tts.model_id(), DEFAULT_TTS_MODEL_ID);
         assert_eq!(tts.operational.cache_dir, config.cache_dir);
+        assert_eq!(tts.operational.output_device, None);
+    }
+
+    #[test]
+    fn output_device_requires_a_canonical_pipewire_id() {
+        let (_root, paths) = fixture(Some(
+            "tts:\n  output_device: pipewire:alsa_output.example\n",
+        ));
+        let tts = Config::load_with_catalog(&paths, &catalog())
+            .unwrap()
+            .tts
+            .unwrap();
+        let device = tts.operational.output_device.unwrap();
+        assert_eq!(device.to_string(), "pipewire:alsa_output.example");
+        assert_eq!(device.id(), "alsa_output.example");
+
+        for output_device in [
+            "",
+            "not-a-device-id",
+            "pipewire:",
+            "pipewire:bad\nnode",
+            "alsa:default",
+        ] {
+            let yaml = format!("tts:\n  output_device: {output_device:?}\n");
+            let (_root, paths) = fixture(Some(&yaml));
+            let error = Config::load_with_catalog(&paths, &catalog())
+                .unwrap()
+                .tts
+                .unwrap_err();
+            assert!(
+                error.contains("tts.output_device"),
+                "{output_device:?}: {error}"
+            );
+        }
+
+        let (_root, paths) = fixture(Some("tts:\n  pipewire_node: legacy-node\n"));
+        let error = Config::load_with_catalog(&paths, &catalog())
+            .unwrap()
+            .tts
+            .unwrap_err();
+        assert!(error.contains("unknown field `pipewire_node`"));
     }
 
     #[test]

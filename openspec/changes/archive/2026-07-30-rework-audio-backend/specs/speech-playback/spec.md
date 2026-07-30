@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: PipeWire speech playback
 `SpeakAloud` SHALL play provider-native mono float PCM through the selected CPAL PipeWire output device without application-level output resampling and SHALL reply only after all successfully generated frames drain or the operation fails.
@@ -30,23 +30,14 @@ When a CPAL PipeWire device ID is configured, playback SHALL target that exact d
 - **WHEN** the configured device ID cannot be resolved for playback
 - **THEN** the method returns `PlaybackFailed` and sends no speech to another device
 
-### Requirement: Configured playback volume
-Playback SHALL apply the configured finite linear volume in the inclusive range `0.0` through `1.0` to speech output, with default `1.0`.
-
-#### Scenario: Reduced volume is configured
-- **WHEN** volume is configured below `1.0`
-- **THEN** every submitted speech sample is scaled according to that volume without changing file or memfd output
-
-#### Scenario: Muted volume is configured
-- **WHEN** volume is `0.0`
-- **THEN** playback completes normally with silent samples
-
 ### Requirement: Non-overlapping speech playback
 Accepted `SpeakAloud` operations SHALL enter a serialized FIFO stage covering streamed synthesis and playback so two calls never play concurrently.
 
 #### Scenario: Two callers speak aloud
 - **WHEN** two valid `SpeakAloud` calls are accepted concurrently
 - **THEN** the second call produces no audible frames until the first playback completes or fails
+
+## ADDED Requirements
 
 ### Requirement: Incremental speech playback
 Playback SHALL accept bounded provider-native audio chunks and SHALL start the output stream when the first nonempty chunk is available rather than requiring the complete utterance. It SHALL write silence during temporary producer underruns and SHALL resume speech when later chunks arrive.

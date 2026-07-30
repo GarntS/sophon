@@ -9,6 +9,7 @@ use std::{
 
 use hound::{SampleFormat, WavReader};
 use memfd::{FileSeal, MemfdOptions};
+use rubato::{Fft, FixedSync, Resampler, audioadapter_buffers::direct::InterleavedSlice};
 
 use crate::error::SophonError;
 
@@ -18,45 +19,158 @@ pub struct OwnedAudio {
     pub sample_rate: u32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedWav {
+    /// Samples in source-frame order, interleaved by channel.
+    pub samples: Vec<f32>,
+    pub source_rate: u32,
+    pub channels: u16,
+}
+
 pub fn parse_wav<R: Read>(
     reader: R,
     max_bytes: u64,
     max_seconds: u64,
-) -> Result<Vec<f32>, SophonError> {
-    let mut reader =
-        WavReader::new(reader).map_err(|e| SophonError::InvalidAudio(e.to_string()))?;
-    let spec = reader.spec();
-    if spec.channels != 1
-        || spec.sample_rate != 16_000
-        || spec.bits_per_sample != 16
-        || spec.sample_format != SampleFormat::Int
-    {
-        return Err(SophonError::InvalidAudio(
-            "expected mono 16 kHz signed 16-bit PCM WAV".into(),
-        ));
-    }
-    let samples = reader
-        .samples::<i16>()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| SophonError::InvalidAudio(e.to_string()))?;
-    let bytes = samples.len() as u64 * 2;
-    if bytes > max_bytes {
+) -> Result<DecodedWav, SophonError> {
+    let mut encoded = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut encoded)
+        .map_err(|error| SophonError::InvalidAudio(error.to_string()))?;
+    if encoded.len() as u64 > max_bytes {
         return Err(SophonError::ResourceLimit(
             "encoded audio exceeds limit".into(),
         ));
     }
-    if samples.len() as u64 > max_seconds * 16_000 {
+
+    let mut wav = WavReader::new(Cursor::new(encoded))
+        .map_err(|error| SophonError::InvalidAudio(error.to_string()))?;
+    let spec = wav.spec();
+    if spec.channels == 0 || spec.sample_rate == 0 {
+        return Err(SophonError::InvalidAudio(
+            "WAV channel count and sample rate must be nonzero".into(),
+        ));
+    }
+
+    let samples = match (spec.sample_format, spec.bits_per_sample) {
+        (SampleFormat::Int, bits @ (8 | 16 | 24 | 32)) => {
+            let scale = 2_f64.powi(i32::from(bits) - 1);
+            wav.samples::<i32>()
+                .map(|sample| {
+                    sample
+                        .map(|sample| (f64::from(sample) / scale) as f32)
+                        .map_err(|error| SophonError::InvalidAudio(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        (SampleFormat::Float, 32) => wav
+            .samples::<f32>()
+            .map(|sample| sample.map_err(|error| SophonError::InvalidAudio(error.to_string())))
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(SophonError::InvalidAudio(format!(
+                "unsupported WAV sample representation: {:?} {}-bit",
+                spec.sample_format, spec.bits_per_sample
+            )));
+        }
+    };
+    let channels = usize::from(spec.channels);
+    if samples.len() % channels != 0 {
+        return Err(SophonError::InvalidAudio(
+            "WAV ends with an incomplete channel frame".into(),
+        ));
+    }
+    let source_frames = samples.len() / channels;
+    if source_frames as u128 > u128::from(max_seconds) * u128::from(spec.sample_rate) {
         return Err(SophonError::ResourceLimit(
             "decoded audio exceeds duration limit".into(),
         ));
     }
-    Ok(samples
-        .into_iter()
-        .map(|sample| sample as f32 / i16::MAX as f32)
-        .collect())
+    if samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(SophonError::InvalidAudio(
+            "WAV contains a non-finite sample".into(),
+        ));
+    }
+    Ok(DecodedWav {
+        samples,
+        source_rate: spec.sample_rate,
+        channels: spec.channels,
+    })
 }
 
-pub fn read_file(path: &Path, max_bytes: u64, max_seconds: u64) -> Result<Vec<f32>, SophonError> {
+pub fn downmix_wav(audio: DecodedWav) -> Result<OwnedAudio, SophonError> {
+    if audio.channels == 0 || audio.source_rate == 0 {
+        return Err(SophonError::InvalidAudio(
+            "WAV channel count and sample rate must be nonzero".into(),
+        ));
+    }
+    let channels = usize::from(audio.channels);
+    let mut frames = audio.samples.chunks_exact(channels);
+    let mut mono = Vec::with_capacity(audio.samples.len() / channels);
+    for frame in &mut frames {
+        if frame.iter().any(|sample| !sample.is_finite()) {
+            return Err(SophonError::InvalidAudio(
+                "WAV contains a non-finite sample".into(),
+            ));
+        }
+        mono.push(
+            frame.iter().map(|sample| f64::from(*sample)).sum::<f64>() as f32 / channels as f32,
+        );
+    }
+    if !frames.remainder().is_empty() {
+        return Err(SophonError::InvalidAudio(
+            "WAV ends with an incomplete channel frame".into(),
+        ));
+    }
+    Ok(OwnedAudio {
+        samples: mono,
+        sample_rate: audio.source_rate,
+    })
+}
+
+pub fn resample_mono(audio: OwnedAudio, target_rate: u32) -> Result<OwnedAudio, SophonError> {
+    if audio.sample_rate == 0 || target_rate == 0 {
+        return Err(SophonError::InvalidAudio(
+            "source and model sample rates must be nonzero".into(),
+        ));
+    }
+    if audio.samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(SophonError::InvalidAudio(
+            "WAV contains a non-finite sample".into(),
+        ));
+    }
+    if audio.sample_rate == target_rate {
+        return Ok(audio);
+    }
+    if audio.samples.is_empty() {
+        return Ok(OwnedAudio {
+            samples: Vec::new(),
+            sample_rate: target_rate,
+        });
+    }
+
+    let input_frames = audio.samples.len();
+    let input = InterleavedSlice::new(&audio.samples, 1, input_frames)
+        .map_err(|error| SophonError::InvalidAudio(error.to_string()))?;
+    let chunk_size = input_frames.clamp(1, 1024);
+    let mut resampler = Fft::<f32>::new(
+        audio.sample_rate as usize,
+        target_rate as usize,
+        chunk_size,
+        1,
+        FixedSync::Input,
+    )
+    .map_err(|error| SophonError::InvalidAudio(format!("cannot resample WAV: {error}")))?;
+    let output = resampler
+        .process_all(&input, input_frames, None)
+        .map_err(|error| SophonError::InvalidAudio(format!("cannot resample WAV: {error}")))?;
+    Ok(OwnedAudio {
+        samples: output.take_data(),
+        sample_rate: target_rate,
+    })
+}
+
+pub fn read_file(path: &Path, max_bytes: u64, max_seconds: u64) -> Result<DecodedWav, SophonError> {
     if !path.is_absolute() {
         return Err(SophonError::InvalidAudio(
             "audio path must be absolute".into(),
@@ -86,7 +200,7 @@ pub fn read_unix_fd(
     fd: OwnedFd,
     max_bytes: u64,
     max_seconds: u64,
-) -> Result<Vec<f32>, SophonError> {
+) -> Result<DecodedWav, SophonError> {
     let mut file = File::from(fd);
     let size = file.metadata().ok().map(|metadata| metadata.len());
     if size.is_some_and(|size| size > max_bytes) {
@@ -103,7 +217,7 @@ pub fn read_seekable<R: Read + Seek>(
     mut reader: R,
     max_bytes: u64,
     max_seconds: u64,
-) -> Result<Vec<f32>, SophonError> {
+) -> Result<DecodedWav, SophonError> {
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|e| SophonError::InvalidAudio(format!("audio descriptor is not seekable: {e}")))?;
@@ -300,7 +414,26 @@ mod tests {
         };
         let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
         for _ in 0..samples * channels as usize {
-            writer.write_sample(0_i16).unwrap();
+            writer.write_sample(0_i32).unwrap();
+        }
+        writer.finalize().unwrap();
+        cursor.into_inner()
+    }
+
+    fn int_wav(channels: u16, rate: u32, bits: u16, samples: &[i32]) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(
+            &mut cursor,
+            hound::WavSpec {
+                channels,
+                sample_rate: rate,
+                bits_per_sample: bits,
+                sample_format: SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in samples {
+            writer.write_sample(*sample).unwrap();
         }
         writer.finalize().unwrap();
         cursor.into_inner()
@@ -329,7 +462,10 @@ mod tests {
     fn accepts_canonical_wav_and_enforces_size_and_duration() {
         let valid = wav(1, 16_000, 16, 2);
         assert_eq!(
-            parse_wav(Cursor::new(valid.clone()), 100, 1).unwrap().len(),
+            parse_wav(Cursor::new(valid.clone()), 100, 1)
+                .unwrap()
+                .samples
+                .len(),
             2
         );
         assert!(matches!(
@@ -343,14 +479,61 @@ mod tests {
     }
 
     #[test]
-    fn rejects_every_noncanonical_wav_property_and_malformed_content() {
-        let mut unsupported_bits = wav(1, 16_000, 16, 1);
-        unsupported_bits[34] = 8;
-        unsupported_bits[35] = 0;
+    fn decodes_supported_pcm_to_interleaved_float_with_source_metadata() {
+        for bits in [8, 16, 24, 32] {
+            let decoded = parse_wav(Cursor::new(wav(2, 8_000, bits, 2)), 100_000, 1).unwrap();
+            assert_eq!(decoded.source_rate, 8_000);
+            assert_eq!(decoded.channels, 2);
+            assert_eq!(decoded.samples, vec![0.0; 4]);
+        }
+        let decoded = parse_wav(
+            Cursor::new(float_wav(2, 22_050, &[0.25, -0.5, 0.75, -1.0])),
+            100_000,
+            1,
+        )
+        .unwrap();
+        assert_eq!(decoded.source_rate, 22_050);
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.samples, [0.25, -0.5, 0.75, -1.0]);
+
+        assert!(matches!(
+            parse_wav(Cursor::new(b"not a wav"), 100_000, 1),
+            Err(SophonError::InvalidAudio(_))
+        ));
+    }
+
+    #[test]
+    fn normalizes_integer_depths_and_rejects_malformed_nonfinite_or_incomplete_wavs() {
+        for (bits, minimum, half) in [
+            (8, -128, 64),
+            (16, -32_768, 16_384),
+            (24, -8_388_608, 4_194_304),
+            (32, i32::MIN, 1_073_741_824),
+        ] {
+            let decoded = parse_wav(
+                Cursor::new(int_wav(1, 16_000, bits, &[minimum, half])),
+                1_000,
+                1,
+            )
+            .unwrap();
+            assert!((decoded.samples[0] + 1.0).abs() < f32::EPSILON);
+            assert!((decoded.samples[1] - 0.5).abs() < f32::EPSILON);
+        }
+
+        let mut zero_channels = wav(1, 16_000, 16, 1);
+        zero_channels[22..24].copy_from_slice(&0_u16.to_le_bytes());
+        let mut zero_rate = wav(1, 16_000, 16, 1);
+        zero_rate[24..28].copy_from_slice(&0_u32.to_le_bytes());
+        let mut incomplete = int_wav(2, 16_000, 16, &[0, 0]);
+        incomplete.truncate(incomplete.len() - 2);
+        let riff_len = (incomplete.len() as u32 - 8).to_le_bytes();
+        incomplete[4..8].copy_from_slice(&riff_len);
+        incomplete[40..44].copy_from_slice(&2_u32.to_le_bytes());
         for input in [
-            wav(2, 16_000, 16, 1),
-            wav(1, 8_000, 16, 1),
-            unsupported_bits,
+            zero_channels,
+            zero_rate,
+            incomplete,
+            float_wav(1, 16_000, &[f32::NAN]),
             b"not a wav".to_vec(),
         ] {
             assert!(matches!(
@@ -361,6 +544,65 @@ mod tests {
     }
 
     #[test]
+    fn downmixes_frames_by_arithmetic_mean_and_rejects_invalid_pcm() {
+        let mono = downmix_wav(DecodedWav {
+            samples: vec![1.0, -1.0, 0.75, 0.25],
+            source_rate: 48_000,
+            channels: 2,
+        })
+        .unwrap();
+        assert_eq!(mono.sample_rate, 48_000);
+        assert_eq!(mono.samples, [0.0, 0.5]);
+
+        for invalid in [
+            DecodedWav {
+                samples: vec![0.0],
+                source_rate: 48_000,
+                channels: 0,
+            },
+            DecodedWav {
+                samples: vec![0.0],
+                source_rate: 0,
+                channels: 1,
+            },
+            DecodedWav {
+                samples: vec![0.0],
+                source_rate: 48_000,
+                channels: 2,
+            },
+            DecodedWav {
+                samples: vec![f32::NAN],
+                source_rate: 48_000,
+                channels: 1,
+            },
+        ] {
+            assert!(matches!(
+                downmix_wav(invalid),
+                Err(SophonError::InvalidAudio(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn resamples_whole_clips_and_bypasses_equal_rates_exactly() {
+        let original = OwnedAudio {
+            samples: (0..800).map(|index| (index as f32 * 0.01).sin()).collect(),
+            sample_rate: 8_000,
+        };
+        assert_eq!(resample_mono(original.clone(), 8_000).unwrap(), original);
+
+        let upsampled = resample_mono(original.clone(), 16_000).unwrap();
+        assert_eq!(upsampled.sample_rate, 16_000);
+        assert_eq!(upsampled.samples.len(), 1_600);
+        assert!(upsampled.samples.iter().all(|sample| sample.is_finite()));
+
+        let downsampled = resample_mono(original, 4_000).unwrap();
+        assert_eq!(downsampled.sample_rate, 4_000);
+        assert_eq!(downsampled.samples.len(), 400);
+        assert!(downsampled.samples.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
     fn file_ingestion_requires_an_absolute_regular_file_and_fd_starts_at_zero() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), wav(1, 16_000, 16, 1)).unwrap();
@@ -368,9 +610,9 @@ mod tests {
             read_file(Path::new("relative.wav"), 100_000, 1),
             Err(SophonError::InvalidAudio(_))
         ));
-        assert_eq!(read_file(file.path(), 100_000, 1).unwrap().len(), 1);
+        assert_eq!(read_file(file.path(), 100_000, 1).unwrap().samples.len(), 1);
         let fd: OwnedFd = File::open(file.path()).unwrap().into();
-        assert_eq!(read_unix_fd(fd, 100_000, 1).unwrap().len(), 1);
+        assert_eq!(read_unix_fd(fd, 100_000, 1).unwrap().samples.len(), 1);
     }
 
     #[test]

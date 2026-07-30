@@ -105,7 +105,7 @@
                 ++ pkgs.lib.optionals (qwenBackend == "vulkan") [ pkgs.vulkan-loader ];
             in pkgs.rustPlatform.buildRustPackage {
               pname = name;
-              version = "2026.1.2";
+              version = "2026.2.0";
               src = self;
               cargoLock.lockFile = ./Cargo.lock;
               cargoBuildFlags = [ "--bins" ] ++ featureFlags;
@@ -122,6 +122,7 @@
                 pkgs.llvmPackages.libclang
               ] ++ qwenNativeBuildInputs;
               buildInputs = [
+                pkgs.alsa-lib
                 pkgs.cacert
                 pkgs.openssl
                 pkgs.pipewire
@@ -163,7 +164,7 @@
                 EOF
               '';
               preFixup = ''
-                externalRpath=${pkgs.lib.makeLibraryPath ([ onnxruntime pkgs.pipewire pkgs.openblas pkgs.stdenv.cc.cc.lib ] ++ qwenRuntimeLibraries)}
+                externalRpath=${pkgs.lib.makeLibraryPath ([ onnxruntime pkgs.alsa-lib pkgs.pipewire pkgs.openblas pkgs.stdenv.cc.cc.lib ] ++ qwenRuntimeLibraries)}
                 for library in $out/lib/*.so*; do
                   patchelf --set-rpath "\$ORIGIN:$externalRpath" "$library"
                 done
@@ -172,6 +173,7 @@
                 done
                 wrapProgram $out/bin/sophon \
                   --set SOPHON_MODEL_REGISTRY_PATH $out/share/sophon/model_registry.yaml \
+                  --set SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt \
                   --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.espeak-ng ]}
               '';
               passthru.qwenBackend = qwenBackend;
@@ -262,6 +264,7 @@
               pkgs.clippy
               pkgs.cmake
               pkgs.pkg-config
+              pkgs.alsa-lib
               pkgs.openblas
               pkgs.stdenv.cc
               pkgs.openssl

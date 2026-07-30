@@ -19,7 +19,7 @@ use sophon::{
     stt::{STTService, STTWorker, TranscriptionOptions, backend},
     tts::{
         TtsCapabilities, TtsProviderModel, TtsService, TtsWorker, create_tts_provider,
-        playback::{PipeWirePlayback, PlaybackWorker},
+        playback::{CpalPlayback, PlaybackWorker},
     },
 };
 
@@ -81,6 +81,12 @@ async fn initialize(
     backend::configure_accelerator(config.accelerator)?;
     handle.loading();
     let model = backend::create_model(engine, &model_dir, Quantization::Int8)?;
+    let model_sample_rate = model.capabilities().sample_rate;
+    if model_sample_rate == 0 {
+        return Err(SophonError::ModelUnavailable(
+            "loaded STT model advertises a zero sample rate".into(),
+        ));
+    }
     let worker = STTWorker::new(model, config.queue_capacity);
     let defaults = TranscriptionOptions {
         language: Some(config.language),
@@ -94,6 +100,8 @@ async fn initialize(
         worker,
         defaults.clone(),
         supported_languages,
+        model_sample_rate,
+        config.max_audio_seconds,
     )));
     Ok(defaults)
 }
@@ -160,10 +168,7 @@ async fn initialize_tts(
         config.operational.queue_capacity,
         config.operational.max_generated_audio_seconds,
     );
-    let playback = PlaybackWorker::new(
-        Box::new(PipeWirePlayback::default()),
-        config.operational.queue_capacity,
-    );
+    let playback = PlaybackWorker::new(Box::new(CpalPlayback), config.operational.queue_capacity);
     let supported_languages = metadata
         .languages
         .iter()

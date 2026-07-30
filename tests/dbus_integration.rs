@@ -18,7 +18,8 @@ use sophon::{
     error::SophonError,
     stt::{STTService, STTWorker, TranscriptionOptions},
     tts::{
-        TtsCapabilities, TtsProvider, TtsRequest, TtsService, TtsWorker,
+        TtsCapabilities, TtsProvider, TtsRequest, TtsService, TtsStreamControl, TtsStreamEvent,
+        TtsWorker,
         playback::{PlaybackRequest, PlaybackWorker, SpeechPlayback},
     },
 };
@@ -108,6 +109,8 @@ impl SpeechModel for FixtureModel {
 
 struct FixtureTtsProvider {
     calls: Arc<Mutex<Vec<TtsRequest>>>,
+    streaming: bool,
+    timeline: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl TtsProvider for FixtureTtsProvider {
@@ -140,21 +143,74 @@ impl TtsProvider for FixtureTtsProvider {
             return Err(SophonError::SynthesisFailed("fixture failure".into()));
         }
         std::thread::sleep(Duration::from_millis(75));
+        self.timeline.lock().unwrap().push("buffered-complete");
         Ok(OwnedAudio {
             samples: vec![request.speed as f32; 240],
             sample_rate: 24_000,
         })
     }
+
+    fn supports_streaming(&self) -> bool {
+        self.streaming
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        request: &TtsRequest,
+        emit: &mut (dyn FnMut(TtsStreamEvent) -> TtsStreamControl + Send),
+    ) -> Result<(), SophonError> {
+        self.calls.lock().unwrap().push(request.clone());
+        self.timeline.lock().unwrap().push("stream-first");
+        if emit(TtsStreamEvent::Format {
+            sample_rate: 24_000,
+        }) == TtsStreamControl::Cancel
+            || emit(TtsStreamEvent::Chunk {
+                samples: vec![0.25; 120],
+            }) == TtsStreamControl::Cancel
+        {
+            return Err(SophonError::SynthesisFailed("fixture cancelled".into()));
+        }
+        std::thread::sleep(Duration::from_millis(75));
+        if request.text == "partial failure" {
+            self.timeline.lock().unwrap().push("stream-failed");
+            return Err(SophonError::SynthesisFailed(
+                "fixture partial failure".into(),
+            ));
+        }
+        self.timeline.lock().unwrap().push("stream-complete");
+        if emit(TtsStreamEvent::Chunk {
+            samples: vec![0.5; 120],
+        }) == TtsStreamControl::Cancel
+        {
+            return Err(SophonError::SynthesisFailed("fixture cancelled".into()));
+        }
+        Ok(())
+    }
 }
 
 struct FixturePlayback {
     calls: Arc<Mutex<Vec<PlaybackRequest>>>,
+    timeline: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl SpeechPlayback for FixturePlayback {
-    fn play(&mut self, request: PlaybackRequest) -> Result<(), SophonError> {
-        self.calls.lock().unwrap().push(request);
+    fn play(&mut self, mut request: PlaybackRequest) -> Result<(), SophonError> {
+        let mut saw_chunk = false;
+        while let Some(event) = request.stream.blocking_next() {
+            match event {
+                TtsStreamEvent::Chunk { .. } if !saw_chunk => {
+                    saw_chunk = true;
+                    self.timeline.lock().unwrap().push("playback-chunk");
+                }
+                TtsStreamEvent::Terminal(result) => {
+                    result?;
+                    break;
+                }
+                _ => {}
+            }
+        }
         std::thread::sleep(Duration::from_millis(25));
+        self.calls.lock().unwrap().push(request);
         Ok(())
     }
 }
@@ -234,22 +290,28 @@ async fn isolated_session_bus_covers_provider_owned_states_and_language_only_opt
         worker,
         defaults.clone(),
         vec!["en".into(), "de".into()],
+        16_000,
+        60,
     ));
 
     let tts_calls = Arc::new(Mutex::new(Vec::new()));
     let playback_calls = Arc::new(Mutex::new(Vec::new()));
+    let timeline = Arc::new(Mutex::new(Vec::new()));
     let mut tts_config = default_tts_config();
     tts_config.operational.queue_capacity = 2;
     let tts_worker = TtsWorker::new(
         Box::new(FixtureTtsProvider {
             calls: tts_calls.clone(),
+            streaming: false,
+            timeline: timeline.clone(),
         }),
         2,
         tts_config.operational.max_generated_audio_seconds,
     );
     let playback = PlaybackWorker::new(
         Box::new(FixturePlayback {
-            calls: playback_calls,
+            calls: playback_calls.clone(),
+            timeline: timeline.clone(),
         }),
         2,
     );
@@ -346,6 +408,75 @@ async fn isolated_session_bus_covers_provider_owned_states_and_language_only_opt
             sophon::tts::VoiceIntent::Default
         ));
     }
+
+    timeline.lock().unwrap().clear();
+    proxy
+        .call::<_, _, ()>("SpeakAloud", &("buffered aloud", empty_options()))
+        .await
+        .unwrap();
+    assert_eq!(
+        *timeline.lock().unwrap(),
+        ["buffered-complete", "playback-chunk"]
+    );
+
+    let streaming_worker = TtsWorker::new(
+        Box::new(FixtureTtsProvider {
+            calls: tts_calls.clone(),
+            streaming: true,
+            timeline: timeline.clone(),
+        }),
+        2,
+        tts_config.operational.max_generated_audio_seconds,
+    );
+    let streaming_playback = PlaybackWorker::new(
+        Box::new(FixturePlayback {
+            calls: playback_calls,
+            timeline: timeline.clone(),
+        }),
+        2,
+    );
+    tts_handle.ready(
+        Arc::new(TtsService::new(
+            streaming_worker,
+            streaming_playback,
+            tts_config.clone(),
+            vec!["en".into()],
+        )),
+        vec!["af_heart".into(), "am_adam".into()],
+        capabilities,
+    );
+
+    timeline.lock().unwrap().clear();
+    proxy
+        .call::<_, _, ()>("SpeakAloud", &("streaming aloud", empty_options()))
+        .await
+        .unwrap();
+    assert_eq!(
+        *timeline.lock().unwrap(),
+        ["stream-first", "playback-chunk", "stream-complete"]
+    );
+
+    timeline.lock().unwrap().clear();
+    let error = proxy
+        .call::<_, _, ()>("SpeakAloud", &("partial failure", empty_options()))
+        .await
+        .unwrap_err();
+    assert_error_name(error, "com.garntresearch.sophon.SynthesisFailed");
+    assert_eq!(
+        *timeline.lock().unwrap(),
+        ["stream-first", "playback-chunk", "stream-failed"]
+    );
+
+    timeline.lock().unwrap().clear();
+    let (_fd, size): (ZbusOwnedFd, u64) = proxy
+        .call(
+            "SpeakToBuffer",
+            &("stream-capable buffered output", empty_options()),
+        )
+        .await
+        .unwrap();
+    assert!(size > 44);
+    assert_eq!(*timeline.lock().unwrap(), ["buffered-complete"]);
 
     let interface = server
         .object_server()

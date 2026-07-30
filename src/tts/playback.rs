@@ -1,35 +1,35 @@
-//! Provider-neutral speech playback and serialized playback scheduling.
+//! CPAL PipeWire playback and serialized playback scheduling.
 
 use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
+    collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
         mpsc::{SyncSender, TrySendError, sync_channel},
     },
     thread,
+    time::Duration,
 };
 
+use cpal::{
+    DeviceId, HostId, Stream, StreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
 use tokio::sync::oneshot;
 
-use pipewire as pw;
-use pw::{
-    properties::properties,
-    spa::{self, pod::Pod},
-    types::ObjectType,
+use crate::{
+    error::SophonError,
+    tts::{TtsStream, TtsStreamEvent},
 };
 
-use crate::{audio::OwnedAudio, error::SophonError};
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct PlaybackRequest {
-    pub audio: OwnedAudio,
-    pub node_name: Option<String>,
+    pub stream: TtsStream,
+    pub output_device: Option<DeviceId>,
     pub volume: f32,
 }
 
 pub trait SpeechPlayback: Send {
-    /// Plays all owned mono float PCM and returns only after the stream drains.
+    /// Consumes one logical mono float stream and returns after its final frame drains.
     fn play(&mut self, request: PlaybackRequest) -> Result<(), SophonError>;
 }
 
@@ -73,240 +73,353 @@ impl PlaybackWorker {
     }
 }
 
-type NodeResolver = dyn Fn(&str) -> Result<u32, SophonError> + Send + Sync;
-
-pub struct PipeWirePlayback {
-    node_resolver: Arc<NodeResolver>,
-}
-
-impl std::fmt::Debug for PipeWirePlayback {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("PipeWirePlayback").finish()
+fn select_device<T>(
+    configured: Option<&DeviceId>,
+    default: impl FnOnce() -> Option<T>,
+    exact: impl FnOnce(&DeviceId) -> Option<T>,
+) -> Result<T, SophonError> {
+    match configured {
+        Some(id) => exact(id).ok_or_else(|| {
+            SophonError::PlaybackFailed(format!(
+                "configured CPAL output device `{id}` is unavailable"
+            ))
+        }),
+        None => default().ok_or_else(|| {
+            SophonError::PlaybackFailed("PipeWire has no default output device".into())
+        }),
     }
 }
 
-impl Default for PipeWirePlayback {
-    fn default() -> Self {
+#[derive(Debug)]
+struct SampleRing {
+    samples: Vec<f32>,
+    read: usize,
+    write: usize,
+    len: usize,
+    generation: u64,
+}
+
+impl SampleRing {
+    fn new(capacity: usize) -> Self {
         Self {
-            node_resolver: Arc::new(Self::resolve_node_name),
+            samples: vec![0.0; capacity.max(1)],
+            read: 0,
+            write: 0,
+            len: 0,
+            generation: 0,
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.samples.len() - self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push_slice(&mut self, input: &[f32]) -> usize {
+        let count = input.len().min(self.available());
+        for sample in &input[..count] {
+            self.samples[self.write] = *sample;
+            self.write = (self.write + 1) % self.samples.len();
+        }
+        self.len += count;
+        if count != 0 {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        count
+    }
+
+    fn pop(&mut self) -> Option<f32> {
+        if self.len == 0 {
+            return None;
+        }
+        let sample = self.samples[self.read];
+        self.read = (self.read + 1) % self.samples.len();
+        self.len -= 1;
+        Some(sample)
+    }
+}
+
+fn fill_ring_from_chunks(ring: &mut SampleRing, chunks: &mut VecDeque<(Vec<f32>, usize)>) {
+    while let Some((samples, offset)) = chunks.front_mut() {
+        let pushed = ring.push_slice(&samples[*offset..]);
+        *offset += pushed;
+        if *offset == samples.len() {
+            chunks.pop_front();
+        }
+        if pushed == 0 {
+            break;
         }
     }
 }
 
-struct PipeWireData {
-    samples: Vec<f32>,
-    position: usize,
-    draining: bool,
+fn drain_complete(
+    chunks_empty: bool,
+    ring_empty: bool,
+    ring_generation: u64,
+    submitted_generation: u64,
+    deadline_nanos: u64,
+    now_nanos: u128,
+) -> bool {
+    chunks_empty
+        && ring_empty
+        && ring_generation == submitted_generation
+        && deadline_nanos != 0
+        && now_nanos >= u128::from(deadline_nanos)
 }
 
-impl PipeWirePlayback {
-    fn error(error: impl std::fmt::Display) -> SophonError {
+fn render_output(
+    output: &mut [f32],
+    channels: usize,
+    volume: f32,
+    ring: Option<&mut SampleRing>,
+) -> usize {
+    output.fill(0.0);
+    if channels == 0 {
+        return 0;
+    }
+    let Some(ring) = ring else {
+        return 0;
+    };
+    let mut consumed = 0;
+    for frame in output.chunks_exact_mut(channels) {
+        let Some(sample) = ring.pop() else {
+            break;
+        };
+        frame.fill(sample * volume);
+        consumed += 1;
+    }
+    consumed
+}
+
+struct CpalSession {
+    _stream: Stream,
+    ring: Arc<Mutex<SampleRing>>,
+    deadline_nanos: Arc<AtomicU64>,
+    submitted_generation: Arc<AtomicU64>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl CpalSession {
+    fn drain_state(&self) -> (bool, u64) {
+        let ring = self
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (ring.is_empty(), ring.generation)
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CpalPlayback;
+
+impl CpalPlayback {
+    const RING_FRAMES: usize = 4_096;
+
+    fn playback_error(error: impl std::fmt::Display) -> SophonError {
         SophonError::PlaybackFailed(error.to_string())
     }
 
-    fn target_node(&self, name: Option<&str>) -> Result<Option<u32>, SophonError> {
-        name.map(|name| (self.node_resolver)(name)).transpose()
-    }
-
-    fn prepare_request(mut request: PlaybackRequest) -> Result<PlaybackRequest, SophonError> {
-        if request.audio.sample_rate == 0 || request.audio.samples.is_empty() {
+    fn open_session(
+        &self,
+        output_device: Option<&DeviceId>,
+        sample_rate: u32,
+        volume: f32,
+    ) -> Result<CpalSession, SophonError> {
+        if sample_rate == 0 {
             return Err(SophonError::PlaybackFailed(
-                "playback requires non-empty audio with a nonzero sample rate".into(),
+                "playback requires a nonzero sample rate".into(),
             ));
         }
+        let host = cpal::host_from_id(HostId::PipeWire).map_err(Self::playback_error)?;
+        let device = select_device(
+            output_device,
+            || host.default_output_device(),
+            |id| host.device_by_id(id),
+        )?;
+        let default = device
+            .default_output_config()
+            .map_err(Self::playback_error)?;
+        let channels = usize::from(default.channels());
+        if channels == 0 {
+            return Err(SophonError::PlaybackFailed(
+                "selected output device has no channels".into(),
+            ));
+        }
+        let config = StreamConfig {
+            channels: default.channels(),
+            sample_rate,
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let ring = Arc::new(Mutex::new(SampleRing::new(Self::RING_FRAMES)));
+        let callback_ring = Arc::clone(&ring);
+        let deadline_nanos = Arc::new(AtomicU64::new(0));
+        let callback_deadline = Arc::clone(&deadline_nanos);
+        let submitted_generation = Arc::new(AtomicU64::new(0));
+        let callback_submitted_generation = Arc::clone(&submitted_generation);
+        let failure = Arc::new(Mutex::new(None));
+        let callback_failure = Arc::clone(&failure);
+        let stream = device
+            .build_output_stream::<f32, _, _>(
+                config,
+                move |output, info| {
+                    let Ok(mut ring) = callback_ring.try_lock() else {
+                        render_output(output, channels, volume, None);
+                        return;
+                    };
+                    let consumed = render_output(output, channels, volume, Some(&mut ring));
+                    if consumed != 0 {
+                        let frames = output.len() / channels;
+                        let duration = Duration::from_secs_f64(frames as f64 / sample_rate as f64);
+                        if let Some(deadline) = info.timestamp().playback.checked_add(duration) {
+                            let nanos = deadline.as_nanos().min(u128::from(u64::MAX)) as u64;
+                            // Publish both values while still holding the ring lock. A
+                            // completion observer can no longer see an empty ring paired
+                            // with the previous callback's stale deadline.
+                            callback_deadline.store(nanos, Ordering::Release);
+                            callback_submitted_generation.store(ring.generation, Ordering::Release);
+                        }
+                    }
+                },
+                move |error| {
+                    *callback_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(error.to_string());
+                },
+                None,
+            )
+            .map_err(|error| {
+                SophonError::PlaybackFailed(format!(
+                    "cannot open {} Hz f32 output stream: {error}",
+                    sample_rate
+                ))
+            })?;
+        stream.play().map_err(Self::playback_error)?;
+        Ok(CpalSession {
+            _stream: stream,
+            ring,
+            deadline_nanos,
+            submitted_generation,
+            failure,
+        })
+    }
+
+    fn fill_ring(session: &CpalSession, chunks: &mut VecDeque<(Vec<f32>, usize)>) {
+        let mut ring = session
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fill_ring_from_chunks(&mut ring, chunks);
+    }
+}
+
+impl SpeechPlayback for CpalPlayback {
+    fn play(&mut self, mut request: PlaybackRequest) -> Result<(), SophonError> {
         if !request.volume.is_finite() || !(0.0..=1.0).contains(&request.volume) {
             return Err(SophonError::PlaybackFailed(
                 "playback volume must be finite and between 0.0 and 1.0".into(),
             ));
         }
         if request
-            .audio
-            .samples
-            .iter()
-            .any(|sample| !sample.is_finite())
+            .output_device
+            .as_ref()
+            .is_some_and(|id| id.host() != HostId::PipeWire || id.id().is_empty())
         {
             return Err(SophonError::PlaybackFailed(
-                "playback audio contains a non-finite sample".into(),
+                "output device must be a canonical PipeWire device ID".into(),
             ));
         }
-        for sample in &mut request.audio.samples {
-            *sample *= request.volume;
-        }
-        Ok(request)
-    }
 
-    fn resolve_node_name(name: &str) -> Result<u32, SophonError> {
-        let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(Self::error)?;
-        let context = pw::context::ContextRc::new(&mainloop, None).map_err(Self::error)?;
-        let core = context.connect_rc(None).map_err(Self::error)?;
-        let registry = core.get_registry_rc().map_err(Self::error)?;
-        let target = Rc::new(Cell::new(None));
-        let target_for_listener = target.clone();
-        let requested = name.to_owned();
-        let _registry_listener = registry
-            .add_listener_local()
-            .global(move |object| {
-                if object.type_ != ObjectType::Node {
-                    return;
-                }
-                let Some(properties) = object.props else {
-                    return;
-                };
-                if properties.get(*pw::keys::NODE_NAME) == Some(requested.as_str())
-                    && properties.get(*pw::keys::MEDIA_CLASS) == Some("Audio/Sink")
-                {
-                    target_for_listener.set(Some(object.id));
-                }
-            })
-            .register();
-        let pending = core.sync(0).map_err(Self::error)?;
-        let done = Rc::new(Cell::new(false));
-        let done_for_listener = done.clone();
-        let loop_for_listener = mainloop.clone();
-        let failure = Rc::new(RefCell::new(None));
-        let failure_for_listener = failure.clone();
-        let _core_listener = core
-            .add_listener_local()
-            .done(move |id, sequence| {
-                if id == pw::core::PW_ID_CORE && sequence == pending {
-                    done_for_listener.set(true);
-                    loop_for_listener.quit();
-                }
-            })
-            .error({
-                let loop_for_error = mainloop.clone();
-                move |_id, _sequence, _result, message| {
-                    *failure_for_listener.borrow_mut() = Some(message.to_owned());
-                    loop_for_error.quit();
-                }
-            })
-            .register();
-        while !done.get() && failure.borrow().is_none() {
-            mainloop.run();
-        }
-        if let Some(error) = failure.borrow_mut().take() {
-            return Err(Self::error(error));
-        }
-        target.get().ok_or_else(|| {
-            SophonError::PlaybackFailed(format!("PipeWire node.name `{name}` was not found"))
-        })
-    }
-}
+        let mut sample_rate = None;
+        let mut chunks = VecDeque::<(Vec<f32>, usize)>::new();
+        let mut session = None;
+        let mut terminal = None;
 
-impl SpeechPlayback for PipeWirePlayback {
-    fn play(&mut self, request: PlaybackRequest) -> Result<(), SophonError> {
-        let request = Self::prepare_request(request)?;
-        pw::init();
-        let target = self.target_node(request.node_name.as_deref())?;
-        let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(Self::error)?;
-        let context = pw::context::ContextRc::new(&mainloop, None).map_err(Self::error)?;
-        let core = context.connect_rc(None).map_err(Self::error)?;
-        let stream = pw::stream::StreamBox::new(
-            &core,
-            "sophon-tts-playback",
-            properties! {
-                *pw::keys::MEDIA_TYPE => "Audio",
-                *pw::keys::MEDIA_CATEGORY => "Playback",
-                *pw::keys::MEDIA_ROLE => "Accessibility",
-                *pw::keys::AUDIO_CHANNELS => "1",
-                *pw::keys::NODE_NAME => "sophon-tts-playback",
-            },
-        )
-        .map_err(Self::error)?;
-
-        let outcome = Rc::new(RefCell::new(None::<Result<(), String>>));
-        let outcome_for_state = outcome.clone();
-        let outcome_for_process = outcome.clone();
-        let outcome_for_drain = outcome.clone();
-        let loop_for_state = mainloop.clone();
-        let loop_for_process = mainloop.clone();
-        let loop_for_drain = mainloop.clone();
-        let _listener = stream
-            .add_local_listener_with_user_data(PipeWireData {
-                samples: request.audio.samples,
-                position: 0,
-                draining: false,
-            })
-            .state_changed(move |_stream, _data, _old, new| {
-                if let pw::stream::StreamState::Error(error) = new {
-                    *outcome_for_state.borrow_mut() = Some(Err(error));
-                    loop_for_state.quit();
-                }
-            })
-            .process(move |stream, data| {
-                if data.position >= data.samples.len() {
-                    if !data.draining {
-                        data.draining = true;
-                        if let Err(error) = stream.flush(true) {
-                            *outcome_for_process.borrow_mut() = Some(Err(error.to_string()));
-                            loop_for_process.quit();
+        loop {
+            while terminal.is_none() {
+                match request.stream.try_next() {
+                    Ok(TtsStreamEvent::Format { sample_rate: rate }) => {
+                        if rate == 0 || sample_rate.replace(rate).is_some() {
+                            return Err(SophonError::PlaybackFailed(
+                                "synthesis supplied an invalid stream format".into(),
+                            ));
                         }
                     }
-                    return;
+                    Ok(TtsStreamEvent::Chunk { samples }) => {
+                        if sample_rate.is_none() {
+                            return Err(SophonError::PlaybackFailed(
+                                "synthesis supplied audio before its format".into(),
+                            ));
+                        }
+                        if samples.iter().any(|sample| !sample.is_finite()) {
+                            return Err(SophonError::PlaybackFailed(
+                                "playback audio contains a non-finite sample".into(),
+                            ));
+                        }
+                        if !samples.is_empty() {
+                            chunks.push_back((samples, 0));
+                        }
+                    }
+                    Ok(TtsStreamEvent::Terminal(result)) => terminal = Some(result),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        return Err(SophonError::SynthesisFailed(
+                            "streaming synthesis stopped without a terminal event".into(),
+                        ));
+                    }
                 }
-                let Some(mut buffer) = stream.dequeue_buffer() else {
-                    return;
-                };
-                let Some(output) = buffer.datas_mut().first_mut().and_then(|data| data.data())
-                else {
-                    return;
-                };
-                let frames = (output.len() / std::mem::size_of::<f32>())
-                    .min(data.samples.len() - data.position);
-                for (destination, sample) in output
-                    .chunks_exact_mut(std::mem::size_of::<f32>())
-                    .zip(&data.samples[data.position..data.position + frames])
-                {
-                    destination.copy_from_slice(&sample.to_le_bytes());
-                }
-                data.position += frames;
-                let chunk = buffer.datas_mut()[0].chunk_mut();
-                *chunk.offset_mut() = 0;
-                *chunk.stride_mut() = std::mem::size_of::<f32>() as i32;
-                *chunk.size_mut() = (frames * std::mem::size_of::<f32>()) as u32;
-            })
-            .drained(move |_stream, _data| {
-                *outcome_for_drain.borrow_mut() = Some(Ok(()));
-                loop_for_drain.quit();
-            })
-            .register()
-            .map_err(Self::error)?;
+            }
 
-        let mut audio_info = spa::param::audio::AudioInfoRaw::new();
-        audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
-        audio_info.set_rate(request.audio.sample_rate);
-        audio_info.set_channels(1);
-        let object = spa::pod::Object {
-            type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-            id: spa::param::ParamType::EnumFormat.as_raw(),
-            properties: audio_info.into(),
-        };
-        let serialized = spa::pod::serialize::PodSerializer::serialize(
-            std::io::Cursor::new(Vec::new()),
-            &spa::pod::Value::Object(object),
-        )
-        .map_err(Self::error)?
-        .0
-        .into_inner();
-        let mut parameters = [Pod::from_bytes(&serialized).ok_or_else(|| {
-            SophonError::PlaybackFailed("could not construct PipeWire audio format".into())
-        })?];
-        stream
-            .connect(
-                spa::utils::Direction::Output,
-                target,
-                pw::stream::StreamFlags::AUTOCONNECT
-                    | pw::stream::StreamFlags::MAP_BUFFERS
-                    | pw::stream::StreamFlags::RT_PROCESS,
-                &mut parameters,
-            )
-            .map_err(Self::error)?;
-        while outcome.borrow().is_none() {
-            mainloop.run();
-        }
-        match outcome.borrow_mut().take().expect("playback outcome set") {
-            Ok(()) => Ok(()),
-            Err(error) => Err(Self::error(error)),
+            if session.is_none() && !chunks.is_empty() {
+                session = Some(self.open_session(
+                    request.output_device.as_ref(),
+                    sample_rate.expect("chunks require a format"),
+                    request.volume,
+                )?);
+            }
+            if let Some(session) = &session {
+                if let Some(error) = session.failure() {
+                    return Err(SophonError::PlaybackFailed(error));
+                }
+                Self::fill_ring(session, &mut chunks);
+            }
+
+            if let Some(result) = terminal.as_ref() {
+                if let Err(error) = result {
+                    return Err(error.clone());
+                }
+                let Some(session) = &session else {
+                    return Err(SophonError::PlaybackFailed(
+                        "synthesis completed without audio".into(),
+                    ));
+                };
+                let (ring_empty, ring_generation) = session.drain_state();
+                let submitted_generation = session.submitted_generation.load(Ordering::Acquire);
+                let deadline = session.deadline_nanos.load(Ordering::Acquire);
+                let now = session._stream.now().as_nanos();
+                if drain_complete(
+                    chunks.is_empty(),
+                    ring_empty,
+                    ring_generation,
+                    submitted_generation,
+                    deadline,
+                    now,
+                ) {
+                    return Ok(());
+                }
+            }
+
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -315,66 +428,88 @@ impl SpeechPlayback for PipeWirePlayback {
 mod tests {
     use super::*;
     use std::{
-        sync::{
-            Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::{Duration, Instant},
+        str::FromStr,
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
 
-    fn request(sample: f32, node_name: Option<&str>, volume: f32) -> PlaybackRequest {
-        PlaybackRequest {
-            audio: OwnedAudio {
-                samples: vec![sample],
-                sample_rate: 24_000,
-            },
-            node_name: node_name.map(str::to_owned),
-            volume,
+    fn stream(events: impl IntoIterator<Item = TtsStreamEvent>) -> TtsStream {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        for event in events {
+            sender.send(event).unwrap();
         }
+        drop(sender);
+        TtsStream::from_receiver(receiver)
     }
 
     #[test]
-    fn pipewire_policy_scales_volume_and_resolves_only_explicit_exact_names() {
-        let prepared = PipeWirePlayback::prepare_request(request(0.8, None, 0.5)).unwrap();
-        assert_eq!(prepared.audio.samples, [0.4]);
-        let muted = PipeWirePlayback::prepare_request(request(0.8, None, 0.0)).unwrap();
-        assert_eq!(muted.audio.samples, [0.0]);
+    fn device_policy_uses_default_or_exact_without_fallback() {
+        assert_eq!(
+            select_device(None, || Some("default"), |_| Some("exact")).unwrap(),
+            "default"
+        );
+        let id = DeviceId::from_str("pipewire:test-device").unwrap();
+        assert_eq!(
+            select_device(Some(&id), || Some("default"), |_| Some("exact")).unwrap(),
+            "exact"
+        );
+        assert!(select_device(Some(&id), || Some("default"), |_| None::<&str>).is_err());
+        assert!(select_device(None, || None::<&str>, |_| Some("exact")).is_err());
+    }
 
-        let names = Arc::new(Mutex::new(Vec::new()));
-        let names_for_resolver = names.clone();
-        let playback = PipeWirePlayback {
-            node_resolver: Arc::new(move |name| {
-                names_for_resolver.lock().unwrap().push(name.to_owned());
-                if name == "sink.ok" {
-                    Ok(42)
-                } else {
-                    Err(SophonError::PlaybackFailed("missing fixture sink".into()))
-                }
-            }),
-        };
-        assert_eq!(playback.target_node(None).unwrap(), None);
-        assert_eq!(playback.target_node(Some("sink.ok")).unwrap(), Some(42));
-        assert!(matches!(
-            playback.target_node(Some("sink.missing")),
-            Err(SophonError::PlaybackFailed(_))
-        ));
-        assert_eq!(*names.lock().unwrap(), ["sink.ok", "sink.missing"]);
+    #[test]
+    fn callback_duplicates_volume_and_writes_silence_on_underrun() {
+        let mut ring = SampleRing::new(4);
+        assert_eq!(ring.push_slice(&[1.0, -0.5]), 2);
+        let mut output = [9.0; 6];
+        assert_eq!(render_output(&mut output, 2, 0.5, Some(&mut ring)), 2);
+        assert_eq!(output, [0.5, 0.5, -0.25, -0.25, 0.0, 0.0]);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn ring_is_bounded_and_fast_producer_chunks_refill_in_order() {
+        let mut ring = SampleRing::new(3);
+        let mut chunks = VecDeque::from([(vec![1.0, 2.0], 0), (vec![3.0, 4.0, 5.0], 0)]);
+        let mut consumed = Vec::new();
+        while !chunks.is_empty() || !ring.is_empty() {
+            fill_ring_from_chunks(&mut ring, &mut chunks);
+            while let Some(sample) = ring.pop() {
+                consumed.push(sample);
+            }
+        }
+        assert_eq!(consumed, [1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(ring.generation, 3);
+    }
+
+    #[test]
+    fn drain_requires_the_latest_ring_generation_and_playback_deadline() {
+        assert!(!drain_complete(false, true, 2, 2, 100, 100));
+        assert!(!drain_complete(true, false, 2, 2, 100, 100));
+        assert!(!drain_complete(true, true, 2, 1, 100, 100));
+        assert!(!drain_complete(true, true, 2, 2, 100, 99));
+        assert!(!drain_complete(true, true, 2, 2, 0, 100));
+        assert!(drain_complete(true, true, 2, 2, 100, 100));
     }
 
     struct FixturePlayback {
-        calls: Arc<Mutex<Vec<PlaybackRequest>>>,
-        active: Arc<AtomicUsize>,
-        maximum_active: Arc<AtomicUsize>,
+        calls: Arc<Mutex<Vec<Vec<f32>>>>,
         fail_first: bool,
     }
 
     impl SpeechPlayback for FixturePlayback {
-        fn play(&mut self, request: PlaybackRequest) -> Result<(), SophonError> {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.maximum_active.fetch_max(active, Ordering::SeqCst);
-            self.calls.lock().unwrap().push(request);
-            std::thread::sleep(Duration::from_millis(20));
-            self.active.fetch_sub(1, Ordering::SeqCst);
+        fn play(&mut self, mut request: PlaybackRequest) -> Result<(), SophonError> {
+            let mut samples = Vec::new();
+            while let Some(event) = request.stream.blocking_next() {
+                match event {
+                    TtsStreamEvent::Chunk { samples: chunk } => samples.extend(chunk),
+                    TtsStreamEvent::Terminal(result) => {
+                        result?;
+                        break;
+                    }
+                    TtsStreamEvent::Format { .. } => {}
+                }
+            }
+            self.calls.lock().unwrap().push(samples);
             if self.fail_first {
                 self.fail_first = false;
                 Err(SophonError::PlaybackFailed("fixture failure".into()))
@@ -384,95 +519,124 @@ mod tests {
         }
     }
 
-    fn fixture(
-        calls: Arc<Mutex<Vec<PlaybackRequest>>>,
-        active: Arc<AtomicUsize>,
-        maximum_active: Arc<AtomicUsize>,
-        fail_first: bool,
-    ) -> Box<dyn SpeechPlayback> {
-        Box::new(FixturePlayback {
-            calls,
-            active,
-            maximum_active,
-            fail_first,
-        })
-    }
-
     #[tokio::test]
-    async fn playback_worker_is_synchronous_fifo_serial_and_recovers_after_failure() {
+    async fn playback_worker_is_fifo_bounded_and_recovers() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let active = Arc::new(AtomicUsize::new(0));
-        let maximum_active = Arc::new(AtomicUsize::new(0));
         let worker = PlaybackWorker::new(
-            fixture(calls.clone(), active.clone(), maximum_active.clone(), true),
-            2,
+            Box::new(FixturePlayback {
+                calls: calls.clone(),
+                fail_first: true,
+            }),
+            1,
         );
-        let started = Instant::now();
+        let request = |sample| PlaybackRequest {
+            stream: stream([
+                TtsStreamEvent::Format {
+                    sample_rate: 24_000,
+                },
+                TtsStreamEvent::Chunk {
+                    samples: vec![sample],
+                },
+                TtsStreamEvent::Terminal(Ok(())),
+            ]),
+            output_device: None,
+            volume: 1.0,
+        };
         assert!(matches!(
-            worker.play(request(1.0, None, 1.0)).await,
+            worker.play(request(1.0)).await,
             Err(SophonError::PlaybackFailed(_))
         ));
-        assert!(started.elapsed() >= Duration::from_millis(20));
-        let (second, third) = tokio::join!(
-            worker.play(request(2.0, Some("sink.ok"), 0.5)),
-            worker.play(request(3.0, None, 1.0))
-        );
-        assert!(second.is_ok());
-        assert!(third.is_ok());
-        assert_eq!(active.load(Ordering::SeqCst), 0);
-        assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            calls
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|request| request.audio.samples[0])
-                .collect::<Vec<_>>(),
-            [1.0, 2.0, 3.0]
-        );
+        assert!(worker.play(request(2.0)).await.is_ok());
+        assert_eq!(*calls.lock().unwrap(), vec![vec![1.0], vec![2.0]]);
+    }
+
+    struct SerialPlayback {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        order: Arc<Mutex<Vec<f32>>>,
+    }
+
+    impl SpeechPlayback for SerialPlayback {
+        fn play(&mut self, mut request: PlaybackRequest) -> Result<(), SophonError> {
+            let active = self.active.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            self.maximum.fetch_max(active, AtomicOrdering::AcqRel);
+            while let Some(event) = request.stream.blocking_next() {
+                match event {
+                    TtsStreamEvent::Chunk { samples } => self.order.lock().unwrap().extend(samples),
+                    TtsStreamEvent::Terminal(result) => {
+                        result?;
+                        break;
+                    }
+                    TtsStreamEvent::Format { .. } => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+            self.active.fetch_sub(1, AtomicOrdering::AcqRel);
+            Ok(())
+        }
     }
 
     #[test]
     #[ignore = "run tests/pipewire-smoke.sh inside nix develop"]
-    fn pipewire_smoke_negotiates_and_drains() {
+    fn cpal_pipewire_smoke_opens_native_rate_and_drains() {
         let node = std::env::var("SOPHON_PIPEWIRE_SMOKE_NODE")
-            .expect("smoke harness must provide an exact PipeWire node.name");
-        let mut playback = PipeWirePlayback::default();
-        playback
-            .play(PlaybackRequest {
-                audio: OwnedAudio {
-                    samples: vec![0.0; 2_400],
-                    sample_rate: 24_000,
-                },
-                node_name: Some(node),
-                volume: 1.0,
-            })
-            .unwrap();
+            .expect("SOPHON_PIPEWIRE_SMOKE_NODE must name the isolated sink");
+        for output_device in [
+            None,
+            Some(DeviceId::from_str(&format!("pipewire:{node}")).unwrap()),
+        ] {
+            for level in [0.05, 0.1, 0.15] {
+                let request = PlaybackRequest {
+                    stream: stream([
+                        TtsStreamEvent::Format {
+                            sample_rate: 24_000,
+                        },
+                        TtsStreamEvent::Chunk {
+                            samples: vec![level; 4_800],
+                        },
+                        TtsStreamEvent::Chunk {
+                            samples: vec![-level; 4_800],
+                        },
+                        TtsStreamEvent::Terminal(Ok(())),
+                    ]),
+                    output_device: output_device.clone(),
+                    volume: 0.5,
+                };
+                CpalPlayback.play(request).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
-    async fn playback_worker_rejects_a_full_queue() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
+    async fn playback_worker_serializes_concurrent_requests() {
         let active = Arc::new(AtomicUsize::new(0));
-        let maximum_active = Arc::new(AtomicUsize::new(0));
-        let worker = PlaybackWorker::new(fixture(calls, active, maximum_active, false), 1);
-        let first = worker.play(request(1.0, None, 1.0));
-        tokio::pin!(first);
-        tokio::select! {
-            _ = &mut first => panic!("playback should not finish immediately"),
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-        }
-        let queued = worker.play(request(2.0, None, 1.0));
-        tokio::pin!(queued);
-        tokio::select! {
-            _ = &mut queued => panic!("queued playback should wait"),
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-        }
-        assert!(matches!(
-            worker.play(request(3.0, None, 1.0)).await,
-            Err(SophonError::ResourceLimit(_))
-        ));
-        assert!(first.await.is_ok());
-        assert!(queued.await.is_ok());
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let worker = PlaybackWorker::new(
+            Box::new(SerialPlayback {
+                active: active.clone(),
+                maximum: maximum.clone(),
+                order: order.clone(),
+            }),
+            2,
+        );
+        let request = |sample| PlaybackRequest {
+            stream: stream([
+                TtsStreamEvent::Format {
+                    sample_rate: 24_000,
+                },
+                TtsStreamEvent::Chunk {
+                    samples: vec![sample],
+                },
+                TtsStreamEvent::Terminal(Ok(())),
+            ]),
+            output_device: None,
+            volume: 1.0,
+        };
+        let (first, second) = tokio::join!(worker.play(request(1.0)), worker.play(request(2.0)));
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(maximum.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(*order.lock().unwrap(), [1.0, 2.0]);
     }
 }
