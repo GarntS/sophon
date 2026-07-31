@@ -1,6 +1,6 @@
 [submodule "third_party/transcribe-rs-migraphx"]
 	path = third_party/transcribe-rs-migraphx
-	url = git@github.com:GarntS/transcribe-rs.git
+	url = https://github.com/GarntS/transcribe-rs.git
 [submodule "third_party/qwentts.cpp"]
 	path = third_party/qwentts.cpp
-	url = git@github.com:ServeurpersoCom/qwentts.cpp.git
+	url = https://github.com/ServeurpersoCom/qwentts.cpp.git
